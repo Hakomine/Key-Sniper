@@ -297,7 +297,7 @@ async function buildDeals(key) {
       id,
       title: c.title,
       slug: c.slug,
-      boxart: c.boxart || null,
+      boxart: 'https://assets.isthereanydeal.com/' + id + '/boxart.jpg',
       histLow,
       pop: popMap.get(id) || 0,
       itadUrl: 'https://isthereanydeal.com/game/' + c.slug + '/info/',
@@ -497,8 +497,9 @@ const HTML = `<!doctype html>
         ? '<span class="badge low">🔥 Keyshop-Allzeittief</span>'
         : '<span class="' + (r.atKsLow ? 'badge low' : 'badge gap') + '">' + r.overLowPct + '% über Keyshop-Tief</span>';
       var sav = (r.savingPct != null && r.savingPct > 0) ? '<span class="badge">−'+r.savingPct+'% ggü. offiziell</span>' : '';
+      var box = '<img class="box" src="https://cdn.cloudflare.steamstatic.com/steam/apps/'+r.appid+'/library_600x900.jpg" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">';
       out.push(
-        '<div class="card"><div class="body">'+
+        '<div class="card">'+box+'<div class="body">'+
         '<p class="title">'+esc(r.title)+'</p>'+
         '<div class="badges">'+over+sav+'</div>'+
         '<div class="row"><span class="price-main">'+eur(r.keyshop)+'</span><span class="prices">Keyshop (Grau-Markt)</span></div>'+

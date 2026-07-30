@@ -251,7 +251,7 @@ async function main() {
       title: c.title,
       slug: c.slug,
       type: c.type,
-      boxart: c.boxart || null,
+      boxart: `https://assets.isthereanydeal.com/${id}/boxart.jpg`,
       histLow,
       pop: popMap.get(id) || 0,
       itadUrl: `https://isthereanydeal.com/game/${c.slug}/info/`,
