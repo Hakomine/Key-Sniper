@@ -18,10 +18,10 @@ const HIST_TOL_PCT = 5;   // "auf Historical Low", wenn <= ATL * (1 + 5%)
 const CACHE_SECONDS = 120; // Serverseitiger Cache fürs Live-Holen
 
 const TRUSTED = [
-  'steam', 'fanatical', 'humble', 'greenmangaming', 'green man gaming',
-  'gog', 'gamesplanet', 'epic', 'microsoft', 'wingamestore', '2game',
-  'indiegala', 'voidu', 'noctre', 'gamebillet', 'ubisoft', 'ea app',
-  'battle.net', 'blizzard',
+  'steam', 'fanatical', 'humble', 'greenmangaming', 'gog', 'gamesplanet',
+  'epic', 'microsoft', 'wingamestore', 'indiegala', 'gamebillet', 'ubisoft',
+  'ea store', 'blizzard', 'gamersgate', 'dlgamer', 'allyouplay', '2game',
+  'zoom platform', 'gamesload', 'dreamgame',
 ];
 
 export default {
