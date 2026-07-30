@@ -17,6 +17,14 @@ const MAX_GAMES = 600;
 const HIST_TOL_PCT = 5;   // "auf Historical Low", wenn <= ATL * (1 + 5%)
 const CACHE_SECONDS = 120; // Serverseitiger Cache fürs Live-Holen
 
+// Keyshop-Radar: die N beliebtesten Steam-Spiele auf Keyshop-Deals abklopfen
+const RADAR_UNIVERSE = 100;      // 100 = ein GG.deals-Block (Rate-Limit-konform)
+const RADAR_CACHE = 1500;        // 25 Min Cache (frisch genug, schont Limit)
+const RADAR_NEAR_LOW_PCT = 15;   // "auf Keyshop-Tief", wenn <= ATL * (1 + 15%)
+const RADAR_MIN_SAVING = 15;     // min. % günstiger als offizieller Preis
+
+const numPos = (x) => (x != null && +x > 0 ? +x : null);
+
 // Seriöse Stores (Häkchen "Nur seriöse Stores" nutzt nur diese)
 const REPUTABLE = [
   'steam', 'fanatical', 'humble', 'greenmangaming', 'gog', 'gamesplanet',
@@ -72,6 +80,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/api/deals') return handleDeals(request, env, ctx);
     if (url.pathname === '/api/keyshop') return handleKeyshop(url, env, ctx);
+    if (url.pathname === '/api/radar') return handleRadar(url, env, ctx);
     if (url.pathname === '/go') return handleGo(url);
     return new Response(HTML, {
       headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -150,6 +159,66 @@ async function handleKeyshop(url, env, ctx) {
 
   const res = json(out);
   res.headers.set('Cache-Control', 'public, max-age=600'); // 10 Min Cache (schont Rate-Limit)
+  ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  return res;
+}
+
+// ---------- Keyshop-Radar: neue Grau-Markt-Deals entdecken ----------
+// Universum: die RADAR_UNIVERSE beliebtesten Steam-Spiele (SteamSpy, nach
+// Bewertungszahl). Preise von GG.deals. Live, alle ~25 Min neu gescannt.
+async function handleRadar(url, env, ctx) {
+  const ggKey = env.GGDEALS_API_KEY;
+  if (!ggKey) return json({ error: 'GGDEALS_API_KEY fehlt (als Secret setzen)' }, 500);
+
+  const cache = caches.default;
+  const cacheKey = new Request('https://key-sniper.cache/radar?r=' + COUNTRY);
+  const fresh = new URL(url).searchParams.get('fresh') === '1';
+  if (!fresh) {
+    const hit = await cache.match(cacheKey);
+    if (hit) return hit;
+  }
+
+  let out;
+  try {
+    // 1) Universum: beliebteste kaufbare Steam-Spiele
+    const ssRes = await fetch('https://steamspy.com/api.php?request=all&page=0');
+    if (!ssRes.ok) throw new Error('SteamSpy HTTP ' + ssRes.status);
+    const ss = await ssRes.json();
+    const games = Object.values(ss)
+      .filter((g) => g && +g.price > 0)
+      .sort((a, b) => (b.positive + b.negative || 0) - (a.positive + a.negative || 0))
+      .slice(0, RADAR_UNIVERSE);
+    const appids = games.map((g) => g.appid);
+
+    // 2) Keyshop-Preise (ein Block, region-genau)
+    const gg = await fetch(
+      'https://api.gg.deals/v1/prices/by-steam-app-id/?ids=' + appids.join(',') +
+        '&region=' + COUNTRY.toLowerCase() + '&key=' + encodeURIComponent(ggKey)
+    );
+    const gj = await gg.json();
+    const data = (gj && gj.data) || {};
+
+    const deals = [];
+    for (const [appid, d] of Object.entries(data)) {
+      if (!d || !d.prices) continue;
+      const ks = numPos(d.prices.currentKeyshops);
+      const retail = numPos(d.prices.currentRetail);
+      const ksLow = numPos(d.prices.historicalKeyshops);
+      if (!ks) continue;
+      const atKsLow = ksLow != null && ks <= ksLow * (1 + RADAR_NEAR_LOW_PCT / 100);
+      const savingAbs = retail != null ? +(retail - ks).toFixed(2) : null;
+      const savingPct = retail != null ? Math.round((1 - ks / retail) * 100) : null;
+      if (!atKsLow && !(savingPct != null && savingPct >= RADAR_MIN_SAVING)) continue;
+      deals.push({ appid: +appid, title: d.title, keyshop: ks, retail, ksLow, savingAbs, savingPct, atKsLow, url: d.url || null });
+    }
+    deals.sort((a, b) => (b.savingAbs || 0) - (a.savingAbs || 0));
+    out = { generatedAt: new Date().toISOString(), universe: RADAR_UNIVERSE, count: deals.length, deals };
+  } catch (e) {
+    return json({ error: 'Radar fehlgeschlagen: ' + e.message }, 502);
+  }
+
+  const res = json(out);
+  res.headers.set('Cache-Control', 'public, max-age=' + RADAR_CACHE);
   ctx.waitUntil(cache.put(cacheKey, res.clone()));
   return res;
 }
@@ -303,7 +372,9 @@ const HTML = `<!doctype html>
   h1 { font-size:22px; margin:0; letter-spacing:-.3px; }
   h1 .em { color:var(--accent); }
   .meta { color:var(--muted); font-size:13px; }
-  #refresh { margin-left:auto; padding:9px 16px; border:0; border-radius:9px; background:var(--accent); color:#04120a; font-weight:650; font-size:14px; cursor:pointer; }
+  .modetoggle { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:14px; font-weight:600; color:var(--accent2); cursor:pointer; user-select:none; padding:7px 12px; border:1px solid var(--accent2); border-radius:9px; }
+  .modetoggle input { width:16px; height:16px; accent-color:var(--accent2); }
+  #refresh { padding:9px 16px; border:0; border-radius:9px; background:var(--accent); color:#04120a; font-weight:650; font-size:14px; cursor:pointer; }
   #refresh:disabled { opacity:.6; cursor:default; }
   .wrap { max-width:1100px; margin:0 auto; padding:0 24px; }
   .controls { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:16px; padding:18px; margin:18px 0; background:var(--panel); border:1px solid var(--border); border-radius:14px; }
@@ -349,6 +420,7 @@ const HTML = `<!doctype html>
   <header><div class="hwrap">
     <h1>🎯 Key <span class="em">Sniper</span></h1>
     <span class="meta" id="meta"></span>
+    <label class="modetoggle"><input type="checkbox" id="radar" /> 🔦 Keyshop-Radar</label>
     <button id="refresh">Aktualisieren</button>
   </div></header>
   <div class="wrap">
@@ -384,6 +456,7 @@ const HTML = `<!doctype html>
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
   var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
+  var RADAR = { deals: [], generatedAt: null, loaded: false, loading: false };
 
   function setMeta(){
     if (DATA.generatedAt){
@@ -392,7 +465,50 @@ const HTML = `<!doctype html>
     } else { $('meta').textContent = ''; }
   }
 
+  async function loadRadar(fresh){
+    if (RADAR.loading) return;
+    RADAR.loading = true;
+    $('grid').innerHTML = '<div class="empty" style="grid-column:1/-1">Scanne die beliebtesten Spiele auf Keyshop-Deals … (paar Sekunden)</div>';
+    try {
+      var res = await fetch('/api/radar' + (fresh ? '?fresh=1' : ''));
+      var d = await res.json();
+      if (d.error) throw new Error(d.error);
+      RADAR = { deals: d.deals || [], generatedAt: d.generatedAt, loaded: true, loading: false };
+    } catch (e) {
+      RADAR.loading = false; RADAR.loaded = false;
+      $('grid').innerHTML = '<div class="empty" style="grid-column:1/-1">Radar-Fehler: ' + esc(e.message) + '<br>Nochmal auf Aktualisieren tippen.</div>';
+      return;
+    }
+    renderRadar();
+  }
+
+  function renderRadar(){
+    if (!RADAR.loaded) { loadRadar(false); return; }
+    if (RADAR.generatedAt){
+      var d = new Date(RADAR.generatedAt);
+      $('meta').textContent = 'Radar-Stand: ' + d.toLocaleTimeString('de-DE') + ' · ' + RADAR.deals.length + ' Keyshop-Deals';
+    }
+    $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den beliebtesten Spielen – nach Ersparnis sortiert';
+    var out = [];
+    for (var i=0;i<RADAR.deals.length;i++){
+      var r = RADAR.deals[i];
+      var low = r.atKsLow ? '<span class="badge low">📉 Keyshop-Tief</span>' : '';
+      var sav = r.savingPct != null ? '<span class="badge gap">−'+r.savingPct+'% ggü. offiziell</span>' : '<span class="badge gap">Keyshop-Deal</span>';
+      out.push(
+        '<div class="card"><div class="body">'+
+        '<p class="title">'+esc(r.title)+'</p>'+
+        '<div class="badges">'+sav+low+'</div>'+
+        '<div class="row"><span class="price-main">'+eur(r.keyshop)+'</span><span class="prices">Keyshop (Grau-Markt)</span></div>'+
+        '<div class="prices">'+(r.retail!=null?'offiziell: '+eur(r.retail):'')+(r.ksLow!=null?' · Keyshop-Tief '+eur(r.ksLow):'')+'</div>'+
+        (r.url ? '<a class="buy" href="'+esc(r.url)+'" target="_blank" rel="noopener">auf GG.deals →</a>' : '')+
+        '</div></div>'
+      );
+    }
+    $('grid').innerHTML = out.join('') || '<div class="empty" style="grid-column:1/-1">Gerade keine Keyshop-Deals gefunden.</div>';
+  }
+
   function render(){
+    if ($('radar').checked) { renderRadar(); return; }
     var gapAbs = parseFloat(ui.gapAbs.value);
     var gapPct = parseInt(ui.gapPct.value, 10);
     var maxPrice = parseInt(ui.maxPrice.value, 10);
@@ -472,7 +588,13 @@ const HTML = `<!doctype html>
 
   var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyRep','onlyLow','onlySteam'];
   for (var k=0;k<keys.length;k++){ ui[keys[k]].addEventListener('input', render); ui[keys[k]].addEventListener('change', render); }
-  $('refresh').addEventListener('click', function(){ load(true); });
+  $('refresh').addEventListener('click', function(){ if ($('radar').checked) loadRadar(true); else load(true); });
+
+  // Radar-Modus umschalten: normale Filter ausblenden, Radar zeigen
+  $('radar').addEventListener('change', function(){
+    document.querySelector('.controls').style.display = this.checked ? 'none' : '';
+    render();
+  });
 
   // Keyshop-Preis auf Abruf (GG.deals) – ein Klick lädt genau dieses Spiel
   $('grid').addEventListener('click', async function(e){
