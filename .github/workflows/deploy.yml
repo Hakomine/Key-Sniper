@@ -1,0 +1,56 @@
+name: Deals sammeln und veröffentlichen
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # täglich 07:00 UTC (~09:00 DE im Sommer)
+  workflow_dispatch: {}    # Knopf zum manuellen Starten
+  push:
+    branches: [main]       # bei jedem Push neu bauen (auch erster Deploy)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Nur ein Deploy gleichzeitig
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Code holen
+        uses: actions/checkout@v4
+
+      - name: Node einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Deals sammeln
+        env:
+          ITAD_API_KEY: ${{ secrets.ITAD_API_KEY }}
+        run: node collector.mjs
+
+      - name: Seite vorbereiten
+        run: |
+          mkdir -p _site
+          cp "Key Sniper.html" _site/index.html
+          cp deals.js _site/deals.js
+
+      - name: Pages konfigurieren
+        uses: actions/configure-pages@v5
+
+      - name: Seite hochladen
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Veröffentlichen
+        id: deploy
+        uses: actions/deploy-pages@v4

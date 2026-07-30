@@ -1,0 +1,13 @@
+# Niemals hochladen: der API-Key
+key.txt
+
+# Generierte Daten (baut der Workflow / lokaler Lauf frisch)
+deals.js
+
+# Node
+node_modules/
+
+# Lokale Overrides / Krempel
+config.local.json
+*.log
+.DS_Store

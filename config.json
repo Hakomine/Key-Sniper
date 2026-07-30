@@ -1,0 +1,29 @@
+{
+  "apiKey": "",
+  "country": "DE",
+  "maxGames": 600,
+  "dealsSort": "-cut",
+  "histLowTolerancePct": 5,
+  "trustedShops": [
+    "Steam",
+    "Fanatical",
+    "Humble",
+    "GreenManGaming",
+    "Green Man Gaming",
+    "GOG",
+    "Gamesplanet",
+    "GamesPlanet",
+    "Epic",
+    "Microsoft",
+    "WinGameStore",
+    "2Game",
+    "IndieGala",
+    "Voidu",
+    "Noctre",
+    "GameBillet",
+    "Ubisoft",
+    "EA app",
+    "Battle.net",
+    "Blizzard"
+  ]
+}
