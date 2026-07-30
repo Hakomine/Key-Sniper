@@ -17,12 +17,55 @@ const MAX_GAMES = 600;
 const HIST_TOL_PCT = 5;   // "auf Historical Low", wenn <= ATL * (1 + 5%)
 const CACHE_SECONDS = 120; // Serverseitiger Cache fürs Live-Holen
 
-const TRUSTED = [
+// Seriöse Stores (Häkchen "Nur seriöse Stores" nutzt nur diese)
+const REPUTABLE = [
   'steam', 'fanatical', 'humble', 'greenmangaming', 'gog', 'gamesplanet',
   'epic', 'microsoft', 'wingamestore', 'indiegala', 'gamebillet', 'ubisoft',
   'ea store', 'blizzard', 'gamersgate', 'dlgamer', 'allyouplay', '2game',
   'zoom platform', 'gamesload', 'dreamgame',
 ];
+// Kleinere / Grauzone-Reseller (nur im Modus "alle Stores")
+const GREY = [
+  'etail.market', 'fireflower', 'fortuna digital', 'gamesporium',
+  'joybuggy', 'muve', 'planetplay', 'playerland', 'playsum',
+];
+const ALL = REPUTABLE.concat(GREY);
+
+const inSet = (set, name) => {
+  const n = (name || '').toLowerCase();
+  return set.some((w) => n.indexOf(w) !== -1);
+};
+
+// Wertet die Angebote eines Spiels für eine Store-Menge aus.
+// Liefert billigster/zweitbilligster + Lücke, oder null bei < 2 Angeboten.
+function analyze(deals, set, histLow) {
+  const byShop = new Map();
+  for (const d of deals || []) {
+    const name = d.shop && d.shop.name;
+    if (!inSet(set, name) || !d.price || d.price.amount == null) continue;
+    const cur = byShop.get(name);
+    if (!cur || d.price.amount < cur.price.amount) byShop.set(name, d);
+  }
+  const sorted = [...byShop.values()].sort((a, b) => a.price.amount - b.price.amount);
+  if (sorted.length < 2) return null;
+  const p0 = sorted[0];
+  const p1 = sorted[1];
+  const drmNames = (p0.drm || []).map((x) => (x.name || '').toLowerCase());
+  const steam = /steam/.test((p0.shop.name || '').toLowerCase()) || drmNames.indexOf('steam') !== -1;
+  return {
+    cheapest: {
+      shop: p0.shop.name,
+      price: p0.price.amount,
+      cut: p0.cut,
+      url: '/go?u=' + encodeURIComponent(p0.url),
+      steam,
+    },
+    second: { shop: p1.shop.name, price: p1.price.amount },
+    gapAbs: +(p1.price.amount - p0.price.amount).toFixed(2),
+    gapPct: Math.round((1 - p0.price.amount / p1.price.amount) * 100),
+    atHistLow: histLow != null ? p0.price.amount <= histLow * (1 + HIST_TOL_PCT / 100) : false,
+  };
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -120,55 +163,31 @@ async function buildDeals(key) {
   const prices = {};
   for (const arr of priceLists) for (const g of arr) prices[g.id] = g;
 
-  // 4) Analyse
+  // 4) Analyse – zwei Sichten pro Spiel: "all" (alle Stores) und "rep" (nur seriöse)
   const results = [];
   for (const id of ids) {
     const g = prices[id];
     if (!g) continue;
     const c = meta.get(id);
-
-    const byShop = new Map();
-    for (const d of g.deals || []) {
-      if (!isTrusted(d.shop && d.shop.name) || !d.price || d.price.amount == null) continue;
-      const cur = byShop.get(d.shop.name);
-      if (!cur || d.price.amount < cur.price.amount) byShop.set(d.shop.name, d);
-    }
-    const sorted = [...byShop.values()].sort((a, b) => a.price.amount - b.price.amount);
-    if (sorted.length < 2) continue;
-
-    const p0 = sorted[0];
-    const p1 = sorted[1];
-    const gapAbs = +(p1.price.amount - p0.price.amount).toFixed(2);
-    const gapPct = Math.round((1 - p0.price.amount / p1.price.amount) * 100);
     const histLow = g.historyLow && g.historyLow.all ? g.historyLow.all.amount : null;
-    const atHistLow = histLow != null ? p0.price.amount <= histLow * (1 + HIST_TOL_PCT / 100) : false;
-    // Steam-Key? Steam-Store selbst hat leeres DRM, Keyshops führen "Steam" im DRM.
-    const drmNames = (p0.drm || []).map((x) => (x.name || '').toLowerCase());
-    const steam = /steam/.test((p0.shop.name || '').toLowerCase()) || drmNames.indexOf('steam') !== -1;
+
+    const all = analyze(g.deals, ALL, histLow);
+    if (!all) continue; // ohne Zweitbilligsten (über alle Stores) keine Lücke
+    const rep = analyze(g.deals, REPUTABLE, histLow);
 
     results.push({
       title: c.title,
       slug: c.slug,
       boxart: c.boxart || null,
-      cheapest: {
-        shop: p0.shop.name,
-        price: p0.price.amount,
-        cut: p0.cut,
-        url: '/go?u=' + encodeURIComponent(p0.url),
-      },
-      second: { shop: p1.shop.name, price: p1.price.amount },
-      regular: (p0.regular && p0.regular.amount) ?? c.regular ?? null,
-      gapAbs,
-      gapPct,
       histLow,
-      atHistLow,
-      steam,
       pop: popMap.get(id) || 0,
       itadUrl: 'https://isthereanydeal.com/game/' + c.slug + '/info/',
+      all,
+      rep,
     });
   }
 
-  results.sort((a, b) => b.gapAbs - a.gapAbs);
+  results.sort((a, b) => b.all.gapAbs - a.all.gapAbs);
   return { generatedAt: new Date().toISOString(), country: COUNTRY, count: results.length, deals: results };
 }
 
@@ -184,11 +203,6 @@ async function itad(path, { method = 'GET', query = {}, body, key } = {}) {
   const r = await fetch(u, opt);
   if (!r.ok) throw new Error(path + ' -> HTTP ' + r.status);
   return r.json();
-}
-
-function isTrusted(name) {
-  const n = (name || '').toLowerCase();
-  return TRUSTED.some((w) => n.includes(w));
 }
 
 // ---------- /go: itad.link -> direkter Shop-Link ----------
@@ -293,7 +307,8 @@ const HTML = `<!doctype html>
       </select></div>
       <div class="ctrl"><label>Suche</label><input type="search" id="q" placeholder="Spielname ..." /></div>
       <div class="ctrl">
-        <label class="toggle"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label>
+        <label class="toggle"><input type="checkbox" id="onlyRep" /> Nur seriöse Stores</label>
+        <label class="toggle" style="margin-top:10px"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label>
         <label class="toggle" style="margin-top:10px"><input type="checkbox" id="onlySteam" /> Nur Steam-Keys</label>
       </div>
     </div>
@@ -306,7 +321,7 @@ const HTML = `<!doctype html>
   function eur(n){ return n==null ? '–' : n.toLocaleString('de-DE',{style:'currency',currency:'EUR'}); }
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
-  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), q:$('q'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
+  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
 
   function setMeta(){
     if (DATA.generatedAt){
@@ -320,46 +335,55 @@ const HTML = `<!doctype html>
     var gapPct = parseInt(ui.gapPct.value, 10);
     var maxPrice = parseInt(ui.maxPrice.value, 10);
     var q = ui.q.value.trim().toLowerCase();
+    var onlyRep = ui.onlyRep.checked;
     var onlyLow = ui.onlyLow.checked;
     var onlySteam = ui.onlySteam.checked;
     $('gapAbsVal').textContent = gapAbs + ' €';
     $('gapPctVal').textContent = gapPct + ' %';
     $('maxPriceVal').textContent = maxPrice === 0 ? 'egal' : maxPrice + ' €';
 
-    var list = (DATA.deals || []).filter(function(r){
-      if (r.gapAbs < gapAbs) return false;
-      if (r.gapPct < gapPct) return false;
-      if (maxPrice > 0 && r.cheapest.price > maxPrice) return false;
-      if (onlyLow && !r.atHistLow) return false;
-      if (onlySteam && !r.steam) return false;
-      if (q && r.title.toLowerCase().indexOf(q) === -1) return false;
+    // aktive Sicht je nach Häkchen: nur seriöse Stores oder alle
+    var items = [];
+    var deals = DATA.deals || [];
+    for (var j=0;j<deals.length;j++){
+      var v = onlyRep ? deals[j].rep : deals[j].all;
+      if (!v) continue;
+      items.push({ r: deals[j], v: v });
+    }
+    items = items.filter(function(x){
+      if (x.v.gapAbs < gapAbs) return false;
+      if (x.v.gapPct < gapPct) return false;
+      if (maxPrice > 0 && x.v.cheapest.price > maxPrice) return false;
+      if (onlyLow && !x.v.atHistLow) return false;
+      if (onlySteam && !x.v.cheapest.steam) return false;
+      if (q && x.r.title.toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
     var s = ui.sort.value;
-    list.sort(function(a,b){
-      if (s==='gapAbs') return b.gapAbs - a.gapAbs;
-      if (s==='gapPct') return b.gapPct - a.gapPct;
-      if (s==='pop') return (b.pop||0) - (a.pop||0) || (b.gapAbs - a.gapAbs);
-      if (s==='price') return a.cheapest.price - b.cheapest.price;
-      if (s==='title') return a.title.localeCompare(b.title);
+    items.sort(function(a,b){
+      if (s==='gapAbs') return b.v.gapAbs - a.v.gapAbs;
+      if (s==='gapPct') return b.v.gapPct - a.v.gapPct;
+      if (s==='pop') return (b.r.pop||0) - (a.r.pop||0) || (b.v.gapAbs - a.v.gapAbs);
+      if (s==='price') return a.v.cheapest.price - b.v.cheapest.price;
+      if (s==='title') return a.r.title.localeCompare(b.r.title);
       return 0;
     });
 
-    $('summary').textContent = list.length + ' von ' + (DATA.deals ? DATA.deals.length : 0) + ' Deals passen zu deinen Filtern';
+    $('summary').textContent = items.length + ' von ' + deals.length + ' Deals passen zu deinen Filtern' + (onlyRep ? ' (nur seriöse Stores)' : '');
     var out = [];
-    for (var i=0;i<list.length;i++){
-      var r = list[i];
+    for (var i=0;i<items.length;i++){
+      var r = items[i].r, v = items[i].v;
       var box = r.boxart ? '<img class="box" src="'+esc(r.boxart)+'" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">' : '<div class="box"></div>';
-      var low = r.atHistLow ? '<span class="badge low">📉 Historical Low</span>' : '';
-      var cut = r.cheapest.cut ? '<span class="badge">−'+r.cheapest.cut+'%</span>' : '';
-      var stm = r.steam ? '<span class="badge steam">Steam</span>' : '';
+      var low = v.atHistLow ? '<span class="badge low">📉 Historical Low</span>' : '';
+      var cut = v.cheapest.cut ? '<span class="badge">−'+v.cheapest.cut+'%</span>' : '';
+      var stm = v.cheapest.steam ? '<span class="badge steam">Steam</span>' : '';
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title"><a href="'+esc(r.itadUrl)+'" target="_blank" rel="noopener">'+esc(r.title)+'</a></p>'+
-        '<div class="badges"><span class="badge gap">'+r.gapAbs+' € / '+r.gapPct+'% Lücke</span>'+low+stm+cut+'</div>'+
-        '<div class="row"><span class="price-main">'+eur(r.cheapest.price)+'</span><span class="prices">bei <b>'+esc(r.cheapest.shop)+'</b></span></div>'+
-        '<div class="prices">Zweitbilligster: '+eur(r.second.price)+' bei '+esc(r.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
-        '<a class="buy" href="'+esc(r.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
+        '<div class="badges"><span class="badge gap">'+v.gapAbs+' € / '+v.gapPct+'% Lücke</span>'+low+stm+cut+'</div>'+
+        '<div class="row"><span class="price-main">'+eur(v.cheapest.price)+'</span><span class="prices">bei <b>'+esc(v.cheapest.shop)+'</b></span></div>'+
+        '<div class="prices">Zweitbilligster: '+eur(v.second.price)+' bei '+esc(v.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
+        '<a class="buy" href="'+esc(v.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
         '</div></div>'
       );
     }
@@ -383,7 +407,7 @@ const HTML = `<!doctype html>
     setMeta(); render();
   }
 
-  var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyLow','onlySteam'];
+  var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyRep','onlyLow','onlySteam'];
   for (var k=0;k<keys.length;k++){ ui[keys[k]].addEventListener('input', render); ui[keys[k]].addEventListener('change', render); }
   $('refresh').addEventListener('click', function(){ load(true); });
   load(false);

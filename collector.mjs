@@ -61,10 +61,41 @@ async function api(pathname, { method = 'GET', query = {}, body } = {}) {
   return res.json();
 }
 
-const isTrusted = (name) => {
+// Store-Mengen: seriös (trustedShops) + Grauzone (greyShops) = alle
+const REPUTABLE = (CFG.trustedShops || []).map((s) => s.toLowerCase());
+const GREY = (CFG.greyShops || []).map((s) => s.toLowerCase());
+const ALL = REPUTABLE.concat(GREY);
+
+const inSet = (set, name) => {
   const n = (name || '').toLowerCase();
-  return CFG.trustedShops.some((w) => n.includes(w.toLowerCase()));
+  return set.some((w) => n.includes(w));
 };
+
+// Wertet die Angebote eines Spiels für eine Store-Menge aus.
+// Liefert billigster/zweitbilligster + Lücke, oder null bei < 2 Angeboten.
+function analyze(deals, set, histLow, tol) {
+  const byShop = new Map();
+  for (const d of deals || []) {
+    const name = d.shop?.name;
+    if (!inSet(set, name) || d.price?.amount == null) continue;
+    const cur = byShop.get(name);
+    if (!cur || d.price.amount < cur.price.amount) byShop.set(name, d);
+  }
+  const sorted = [...byShop.values()].sort((a, b) => a.price.amount - b.price.amount);
+  if (sorted.length < 2) return null;
+  const p0 = sorted[0];
+  const p1 = sorted[1];
+  const drmNames = (p0.drm || []).map((x) => (x.name || '').toLowerCase());
+  const steam = /steam/.test((p0.shop.name || '').toLowerCase()) || drmNames.includes('steam');
+  return {
+    cheapest: { shop: p0.shop.name, price: p0.price.amount, cut: p0.cut, url: p0.url, steam },
+    second: { shop: p1.shop.name, price: p1.price.amount },
+    gapAbs: +(p1.price.amount - p0.price.amount).toFixed(2),
+    gapPct: Math.round((1 - p0.price.amount / p1.price.amount) * 100),
+    atHistLow: histLow != null ? p0.price.amount <= histLow * (1 + tol / 100) : false,
+    currency: p0.price.currency || 'EUR',
+  };
+}
 
 // Löst einen itad.link-Redirect zur echten Store-URL auf.
 // Bei Fehler wird der Original-Link zurückgegeben (Button funktioniert immer).
@@ -97,19 +128,30 @@ async function resolveStoreUrl(u) {
   return cur;
 }
 
-// Löst viele Links parallel auf (begrenzte Gleichzeitigkeit).
-async function resolveAll(items, concurrency = 12) {
+// Löst alle Shop-Links (beide Sichten) parallel auf – jede URL nur einmal.
+async function resolveAll(results, concurrency = 12) {
+  const urls = new Set();
+  for (const r of results) {
+    if (r.all) urls.add(r.all.cheapest.url);
+    if (r.rep) urls.add(r.rep.cheapest.url);
+  }
+  const list = [...urls];
+  const map = new Map();
   let i = 0;
   let done = 0;
   const worker = async () => {
-    while (i < items.length) {
-      const r = items[i++];
-      r.cheapest.url = await resolveStoreUrl(r.cheapest.url);
+    while (i < list.length) {
+      const u = list[i++];
+      map.set(u, await resolveStoreUrl(u));
       done++;
-      if (done % 50 === 0) console.log(`  ... ${done}/${items.length} Shop-Links aufgelöst`);
+      if (done % 50 === 0) console.log(`  ... ${done}/${list.length} Shop-Links aufgelöst`);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, worker));
+  for (const r of results) {
+    if (r.all) r.all.cheapest.url = map.get(r.all.cheapest.url) || r.all.cheapest.url;
+    if (r.rep) r.rep.cheapest.url = map.get(r.rep.cheapest.url) || r.rep.cheapest.url;
+  }
 }
 
 // 1) Marktweite Deals als Kandidaten (jedes Spiel einmal)
@@ -198,57 +240,37 @@ async function main() {
     const g = prices[id];
     if (!g) continue;
     const c = meta.get(id);
-
-    // Nur seriöse Shops, pro Shop den billigsten Preis behalten
-    const byShop = new Map();
-    for (const d of g.deals || []) {
-      if (!isTrusted(d.shop?.name) || d.price?.amount == null) continue;
-      const cur = byShop.get(d.shop.name);
-      if (!cur || d.price.amount < cur.price.amount) byShop.set(d.shop.name, d);
-    }
-    const sorted = [...byShop.values()].sort((a, b) => a.price.amount - b.price.amount);
-    if (sorted.length < 2) continue; // ohne Zweitbilligsten gibt es keine Lücke
-
-    const p0 = sorted[0];
-    const p1 = sorted[1];
-    const gapAbs = +(p1.price.amount - p0.price.amount).toFixed(2);
-    const gapPct = Math.round((1 - p0.price.amount / p1.price.amount) * 100);
     const histLow = g.historyLow?.all?.amount ?? null;
-    const atHistLow = histLow != null ? p0.price.amount <= histLow * (1 + tol / 100) : false;
-    // Steam-Key? Steam-Store hat leeres DRM, Keyshops führen "Steam" im DRM.
-    const drmNames = (p0.drm || []).map((x) => (x.name || '').toLowerCase());
-    const steam = /steam/.test((p0.shop.name || '').toLowerCase()) || drmNames.includes('steam');
+
+    // Zwei Sichten: "all" (alle Stores) und "rep" (nur seriöse)
+    const all = analyze(g.deals, ALL, histLow, tol);
+    if (!all) continue; // ohne Zweitbilligsten (über alle Stores) keine Lücke
+    const rep = analyze(g.deals, REPUTABLE, histLow, tol);
 
     results.push({
       title: c.title,
       slug: c.slug,
       type: c.type,
       boxart: c.boxart || null,
-      cheapest: { shop: p0.shop.name, price: p0.price.amount, cut: p0.cut, url: p0.url },
-      second: { shop: p1.shop.name, price: p1.price.amount },
-      regular: p0.regular?.amount ?? c.regular ?? null,
-      currency: p0.price.currency || 'EUR',
-      gapAbs,
-      gapPct,
       histLow,
-      atHistLow,
-      steam,
       pop: popMap.get(id) || 0,
-      trustedCount: sorted.length,
       itadUrl: `https://isthereanydeal.com/game/${c.slug}/info/`,
+      all,
+      rep,
     });
   }
 
-  console.log(`  Löse direkte Shop-Links auf (${results.length}) ...`);
+  console.log(`  Löse direkte Shop-Links auf ...`);
   await resolveAll(results);
 
-  results.sort((a, b) => b.gapAbs - a.gapAbs);
+  results.sort((a, b) => b.all.gapAbs - a.all.gapAbs);
 
   const payload = {
     generatedAt: new Date().toISOString(),
     country: COUNTRY,
     count: results.length,
     trustedShops: CFG.trustedShops,
+    greyShops: CFG.greyShops,
     deals: results,
   };
   fs.writeFileSync(
@@ -259,10 +281,11 @@ async function main() {
   console.log(`\n  Fertig: ${results.length} Schnäppchen-Kandidaten -> deals.js`);
   const top = results.slice(0, 5);
   if (top.length) {
-    console.log('  Top-Lücken:');
+    console.log('  Top-Lücken (alle Stores):');
     for (const r of top) {
+      const v = r.all;
       console.log(
-        `   • ${r.title}: ${r.cheapest.price}€ (${r.cheapest.shop}) vs ${r.second.price}€  = ${r.gapAbs}€ Lücke${r.atHistLow ? '  [Historical Low]' : ''}`
+        `   • ${r.title}: ${v.cheapest.price}€ (${v.cheapest.shop}) vs ${v.second.price}€  = ${v.gapAbs}€ Lücke${v.atHistLow ? '  [Historical Low]' : ''}`
       );
     }
   }

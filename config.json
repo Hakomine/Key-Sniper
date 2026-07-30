@@ -26,5 +26,16 @@
     "ZOOM Platform",
     "Gamesload",
     "Dreamgame"
+  ],
+  "greyShops": [
+    "eTail.Market",
+    "FireFlower",
+    "Fortuna Digital",
+    "Gamesporium",
+    "JoyBuggy",
+    "Muve",
+    "PlanetPlay",
+    "PlayerLand",
+    "Playsum"
   ]
 }

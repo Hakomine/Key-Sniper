@@ -104,7 +104,8 @@
         <input type="search" id="q" placeholder="Spielname ..." />
       </div>
       <div class="ctrl">
-        <label class="toggle"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label>
+        <label class="toggle"><input type="checkbox" id="onlyRep" /> Nur seriöse Stores</label>
+        <label class="toggle" style="margin-top:10px"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label>
         <label class="toggle" style="margin-top:10px"><input type="checkbox" id="onlySteam" /> Nur Steam-Keys</label>
       </div>
     </div>
@@ -129,7 +130,7 @@
 
   const ui = {
     gapAbs: $("gapAbs"), gapPct: $("gapPct"), maxPrice: $("maxPrice"),
-    sort: $("sort"), q: $("q"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
+    sort: $("sort"), q: $("q"), onlyRep: $("onlyRep"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
   };
 
   function render() {
@@ -137,32 +138,13 @@
     const gapPct = parseInt(ui.gapPct.value, 10);
     const maxPrice = parseInt(ui.maxPrice.value, 10);
     const q = ui.q.value.trim().toLowerCase();
+    const onlyRep = ui.onlyRep.checked;
     const onlyLow = ui.onlyLow.checked;
     const onlySteam = ui.onlySteam.checked;
 
     $("gapAbsVal").textContent = gapAbs + " €";
     $("gapPctVal").textContent = gapPct + " %";
     $("maxPriceVal").textContent = maxPrice === 0 ? "egal" : maxPrice + " €";
-
-    let list = (D.deals || []).filter((r) => {
-      if (r.gapAbs < gapAbs) return false;
-      if (r.gapPct < gapPct) return false;
-      if (maxPrice > 0 && r.cheapest.price > maxPrice) return false;
-      if (onlyLow && !r.atHistLow) return false;
-      if (onlySteam && !r.steam) return false;
-      if (q && !r.title.toLowerCase().includes(q)) return false;
-      return true;
-    });
-
-    const s = ui.sort.value;
-    list.sort((a, b) => {
-      if (s === "gapAbs") return b.gapAbs - a.gapAbs;
-      if (s === "gapPct") return b.gapPct - a.gapPct;
-      if (s === "pop") return (b.pop || 0) - (a.pop || 0) || (b.gapAbs - a.gapAbs);
-      if (s === "price") return a.cheapest.price - b.cheapest.price;
-      if (s === "title") return a.title.localeCompare(b.title);
-      return 0;
-    });
 
     const grid = $("grid");
     if (!D.deals || D.deals.length === 0) {
@@ -171,36 +153,63 @@
       grid.insertAdjacentHTML("beforeend",
         `<div class="empty" style="grid-column:1/-1">
           <p style="font-size:16px">Noch keine Deals gesammelt.</p>
-          <p>Trag deinen ITAD-Key in <code>config.json</code> ein und starte <code>run.bat</code>
+          <p>Trag deinen ITAD-Key in <code>key.txt</code> ein und starte <code>run.bat</code>
           (oder <code>node collector.mjs</code>).</p>
           <p>Key gibt's kostenlos auf <a class="link" href="https://isthereanydeal.com/apps/" target="_blank" rel="noopener">isthereanydeal.com/apps</a></p>
         </div>`);
       return;
     }
 
-    $("summary").textContent = `${list.length} von ${D.deals.length} Deals passen zu deinen Filtern`;
-    grid.innerHTML = list.map((r) => {
+    // aktive Sicht je nach Häkchen: nur seriöse Stores oder alle
+    let items = [];
+    for (const r of D.deals) {
+      const v = onlyRep ? r.rep : r.all;
+      if (!v) continue;
+      items.push({ r, v });
+    }
+    items = items.filter(({ r, v }) => {
+      if (v.gapAbs < gapAbs) return false;
+      if (v.gapPct < gapPct) return false;
+      if (maxPrice > 0 && v.cheapest.price > maxPrice) return false;
+      if (onlyLow && !v.atHistLow) return false;
+      if (onlySteam && !v.cheapest.steam) return false;
+      if (q && !r.title.toLowerCase().includes(q)) return false;
+      return true;
+    });
+
+    const s = ui.sort.value;
+    items.sort((a, b) => {
+      if (s === "gapAbs") return b.v.gapAbs - a.v.gapAbs;
+      if (s === "gapPct") return b.v.gapPct - a.v.gapPct;
+      if (s === "pop") return (b.r.pop || 0) - (a.r.pop || 0) || (b.v.gapAbs - a.v.gapAbs);
+      if (s === "price") return a.v.cheapest.price - b.v.cheapest.price;
+      if (s === "title") return a.r.title.localeCompare(b.r.title);
+      return 0;
+    });
+
+    $("summary").textContent = `${items.length} von ${D.deals.length} Deals passen zu deinen Filtern${onlyRep ? " (nur seriöse Stores)" : ""}`;
+    grid.innerHTML = items.map(({ r, v }) => {
       const box = r.boxart
         ? `<img class="box" src="${r.boxart}" alt="" loading="lazy" onerror="this.style.display='none'">`
         : `<div class="box"></div>`;
-      const lowBadge = r.atHistLow ? `<span class="badge low">📉 Historical Low</span>` : "";
-      const steamBadge = r.steam ? `<span class="badge steam">Steam</span>` : "";
-      const cutBadge = r.cheapest.cut ? `<span class="badge">−${r.cheapest.cut}%</span>` : "";
+      const lowBadge = v.atHistLow ? `<span class="badge low">📉 Historical Low</span>` : "";
+      const steamBadge = v.cheapest.steam ? `<span class="badge steam">Steam</span>` : "";
+      const cutBadge = v.cheapest.cut ? `<span class="badge">−${v.cheapest.cut}%</span>` : "";
       return `<div class="card">
         ${box}
         <div class="body">
           <p class="title"><a href="${r.itadUrl}" target="_blank" rel="noopener">${r.title}</a></p>
           <div class="badges">
-            <span class="badge gap">${r.gapAbs} € / ${r.gapPct}% Lücke</span>
+            <span class="badge gap">${v.gapAbs} € / ${v.gapPct}% Lücke</span>
             ${lowBadge}${steamBadge}${cutBadge}
           </div>
           <div class="row">
-            <span class="price-main">${eur(r.cheapest.price)}</span>
-            <span class="prices">bei <b>${r.cheapest.shop}</b></span>
+            <span class="price-main">${eur(v.cheapest.price)}</span>
+            <span class="prices">bei <b>${v.cheapest.shop}</b></span>
           </div>
-          <div class="prices">Zweitbilligster: ${eur(r.second.price)} bei ${r.second.shop}
+          <div class="prices">Zweitbilligster: ${eur(v.second.price)} bei ${v.second.shop}
             ${r.histLow != null ? ` · ATL ${eur(r.histLow)}` : ""}</div>
-          <a class="buy" href="${r.cheapest.url}" target="_blank" rel="noopener">Zum Shop →</a>
+          <a class="buy" href="${v.cheapest.url}" target="_blank" rel="noopener">Zum Shop →</a>
         </div>
       </div>`;
     }).join("");
