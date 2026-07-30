@@ -142,6 +142,9 @@ async function buildDeals(key) {
     const gapPct = Math.round((1 - p0.price.amount / p1.price.amount) * 100);
     const histLow = g.historyLow && g.historyLow.all ? g.historyLow.all.amount : null;
     const atHistLow = histLow != null ? p0.price.amount <= histLow * (1 + HIST_TOL_PCT / 100) : false;
+    // Steam-Key? Steam-Store selbst hat leeres DRM, Keyshops führen "Steam" im DRM.
+    const drmNames = (p0.drm || []).map((x) => (x.name || '').toLowerCase());
+    const steam = /steam/.test((p0.shop.name || '').toLowerCase()) || drmNames.indexOf('steam') !== -1;
 
     results.push({
       title: c.title,
@@ -159,6 +162,7 @@ async function buildDeals(key) {
       gapPct,
       histLow,
       atHistLow,
+      steam,
       pop: popMap.get(id) || 0,
       itadUrl: 'https://isthereanydeal.com/game/' + c.slug + '/info/',
     });
@@ -259,6 +263,7 @@ const HTML = `<!doctype html>
   .badge { font-size:11px; padding:3px 8px; border-radius:999px; background:var(--panel2); border:1px solid var(--border); color:var(--muted); }
   .badge.low { color:var(--gold); border-color:var(--gold); }
   .badge.gap { color:var(--accent); border-color:var(--accent); font-weight:600; }
+  .badge.steam { color:var(--accent2); border-color:var(--accent2); }
   .prices { font-size:13px; color:var(--muted); }
   .prices b { color:var(--text); }
   .price-main { font-size:20px; font-weight:700; color:var(--accent); }
@@ -287,7 +292,10 @@ const HTML = `<!doctype html>
         <option value="title">Name (A–Z)</option>
       </select></div>
       <div class="ctrl"><label>Suche</label><input type="search" id="q" placeholder="Spielname ..." /></div>
-      <div class="ctrl"><label class="toggle"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label></div>
+      <div class="ctrl">
+        <label class="toggle"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label>
+        <label class="toggle" style="margin-top:10px"><input type="checkbox" id="onlySteam" /> Nur Steam-Keys</label>
+      </div>
     </div>
     <p class="summary" id="summary"></p>
     <div class="grid" id="grid"></div>
@@ -298,7 +306,7 @@ const HTML = `<!doctype html>
   function eur(n){ return n==null ? '–' : n.toLocaleString('de-DE',{style:'currency',currency:'EUR'}); }
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
-  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), q:$('q'), onlyLow:$('onlyLow') };
+  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), q:$('q'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
 
   function setMeta(){
     if (DATA.generatedAt){
@@ -313,6 +321,7 @@ const HTML = `<!doctype html>
     var maxPrice = parseInt(ui.maxPrice.value, 10);
     var q = ui.q.value.trim().toLowerCase();
     var onlyLow = ui.onlyLow.checked;
+    var onlySteam = ui.onlySteam.checked;
     $('gapAbsVal').textContent = gapAbs + ' €';
     $('gapPctVal').textContent = gapPct + ' %';
     $('maxPriceVal').textContent = maxPrice === 0 ? 'egal' : maxPrice + ' €';
@@ -322,6 +331,7 @@ const HTML = `<!doctype html>
       if (r.gapPct < gapPct) return false;
       if (maxPrice > 0 && r.cheapest.price > maxPrice) return false;
       if (onlyLow && !r.atHistLow) return false;
+      if (onlySteam && !r.steam) return false;
       if (q && r.title.toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
@@ -342,10 +352,11 @@ const HTML = `<!doctype html>
       var box = r.boxart ? '<img class="box" src="'+esc(r.boxart)+'" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">' : '<div class="box"></div>';
       var low = r.atHistLow ? '<span class="badge low">📉 Historical Low</span>' : '';
       var cut = r.cheapest.cut ? '<span class="badge">−'+r.cheapest.cut+'%</span>' : '';
+      var stm = r.steam ? '<span class="badge steam">Steam</span>' : '';
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title"><a href="'+esc(r.itadUrl)+'" target="_blank" rel="noopener">'+esc(r.title)+'</a></p>'+
-        '<div class="badges"><span class="badge gap">'+r.gapAbs+' € / '+r.gapPct+'% Lücke</span>'+low+cut+'</div>'+
+        '<div class="badges"><span class="badge gap">'+r.gapAbs+' € / '+r.gapPct+'% Lücke</span>'+low+stm+cut+'</div>'+
         '<div class="row"><span class="price-main">'+eur(r.cheapest.price)+'</span><span class="prices">bei <b>'+esc(r.cheapest.shop)+'</b></span></div>'+
         '<div class="prices">Zweitbilligster: '+eur(r.second.price)+' bei '+esc(r.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
         '<a class="buy" href="'+esc(r.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
@@ -372,7 +383,7 @@ const HTML = `<!doctype html>
     setMeta(); render();
   }
 
-  var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyLow'];
+  var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyLow','onlySteam'];
   for (var k=0;k<keys.length;k++){ ui[keys[k]].addEventListener('input', render); ui[keys[k]].addEventListener('change', render); }
   $('refresh').addEventListener('click', function(){ load(true); });
   load(false);

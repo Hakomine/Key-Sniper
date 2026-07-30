@@ -215,6 +215,9 @@ async function main() {
     const gapPct = Math.round((1 - p0.price.amount / p1.price.amount) * 100);
     const histLow = g.historyLow?.all?.amount ?? null;
     const atHistLow = histLow != null ? p0.price.amount <= histLow * (1 + tol / 100) : false;
+    // Steam-Key? Steam-Store hat leeres DRM, Keyshops führen "Steam" im DRM.
+    const drmNames = (p0.drm || []).map((x) => (x.name || '').toLowerCase());
+    const steam = /steam/.test((p0.shop.name || '').toLowerCase()) || drmNames.includes('steam');
 
     results.push({
       title: c.title,
@@ -229,6 +232,7 @@ async function main() {
       gapPct,
       histLow,
       atHistLow,
+      steam,
       pop: popMap.get(id) || 0,
       trustedCount: sorted.length,
       itadUrl: `https://isthereanydeal.com/game/${c.slug}/info/`,

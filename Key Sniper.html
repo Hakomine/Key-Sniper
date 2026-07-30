@@ -54,6 +54,7 @@
     border: 1px solid var(--border); color: var(--muted); }
   .badge.low { color: var(--gold); border-color: var(--gold); }
   .badge.gap { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .badge.steam { color: var(--accent2); border-color: var(--accent2); }
   .prices { font-size: 13px; color: var(--muted); }
   .prices b { color: var(--text); }
   .price-main { font-size: 20px; font-weight: 700; color: var(--accent); }
@@ -104,6 +105,7 @@
       </div>
       <div class="ctrl">
         <label class="toggle"><input type="checkbox" id="onlyLow" /> Nur Historical Low</label>
+        <label class="toggle" style="margin-top:10px"><input type="checkbox" id="onlySteam" /> Nur Steam-Keys</label>
       </div>
     </div>
 
@@ -127,7 +129,7 @@
 
   const ui = {
     gapAbs: $("gapAbs"), gapPct: $("gapPct"), maxPrice: $("maxPrice"),
-    sort: $("sort"), q: $("q"), onlyLow: $("onlyLow"),
+    sort: $("sort"), q: $("q"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
   };
 
   function render() {
@@ -136,6 +138,7 @@
     const maxPrice = parseInt(ui.maxPrice.value, 10);
     const q = ui.q.value.trim().toLowerCase();
     const onlyLow = ui.onlyLow.checked;
+    const onlySteam = ui.onlySteam.checked;
 
     $("gapAbsVal").textContent = gapAbs + " €";
     $("gapPctVal").textContent = gapPct + " %";
@@ -146,6 +149,7 @@
       if (r.gapPct < gapPct) return false;
       if (maxPrice > 0 && r.cheapest.price > maxPrice) return false;
       if (onlyLow && !r.atHistLow) return false;
+      if (onlySteam && !r.steam) return false;
       if (q && !r.title.toLowerCase().includes(q)) return false;
       return true;
     });
@@ -180,6 +184,7 @@
         ? `<img class="box" src="${r.boxart}" alt="" loading="lazy" onerror="this.style.display='none'">`
         : `<div class="box"></div>`;
       const lowBadge = r.atHistLow ? `<span class="badge low">📉 Historical Low</span>` : "";
+      const steamBadge = r.steam ? `<span class="badge steam">Steam</span>` : "";
       const cutBadge = r.cheapest.cut ? `<span class="badge">−${r.cheapest.cut}%</span>` : "";
       return `<div class="card">
         ${box}
@@ -187,7 +192,7 @@
           <p class="title"><a href="${r.itadUrl}" target="_blank" rel="noopener">${r.title}</a></p>
           <div class="badges">
             <span class="badge gap">${r.gapAbs} € / ${r.gapPct}% Lücke</span>
-            ${lowBadge}${cutBadge}
+            ${lowBadge}${steamBadge}${cutBadge}
           </div>
           <div class="row">
             <span class="price-main">${eur(r.cheapest.price)}</span>
