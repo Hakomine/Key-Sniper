@@ -71,6 +71,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname === '/api/deals') return handleDeals(request, env, ctx);
+    if (url.pathname === '/api/keyshop') return handleKeyshop(url, env, ctx);
     if (url.pathname === '/go') return handleGo(url);
     return new Response(HTML, {
       headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -102,6 +103,53 @@ async function handleDeals(request, env, ctx) {
 
   const res = json(data);
   res.headers.set('Cache-Control', 'public, max-age=' + CACHE_SECONDS);
+  ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  return res;
+}
+
+// ---------- Keyshop-Preis für EIN Spiel (GG.deals, auf Abruf) ----------
+// Kette: ITAD-uuid -> Steam-App-ID -> GG.deals-Preise (inkl. Grau-Markt).
+async function handleKeyshop(url, env, ctx) {
+  const id = url.searchParams.get('id');
+  if (!id) return json({ error: 'id fehlt' }, 400);
+  const ggKey = env.GGDEALS_API_KEY;
+  if (!ggKey) return json({ error: 'GGDEALS_API_KEY fehlt (als Secret setzen)' }, 500);
+
+  const cache = caches.default;
+  const cacheKey = new Request('https://key-sniper.cache/keyshop?id=' + id);
+  const hit = await cache.match(cacheKey);
+  if (hit) return hit;
+
+  let out;
+  try {
+    const info = await itad('/games/info/v2', { query: { id }, key: env.ITAD_API_KEY });
+    const appid = info && info.appid;
+    if (!appid) {
+      out = { available: false };
+    } else {
+      const gg = await fetch(
+        'https://api.gg.deals/v1/prices/by-steam-app-id/?ids=' + appid + '&region=' + COUNTRY.toLowerCase() + '&key=' + encodeURIComponent(ggKey)
+      );
+      const gj = await gg.json();
+      const d = gj && gj.data && gj.data[String(appid)];
+      const p = (d && d.prices) || null;
+      const num = (x) => (x != null && +x > 0 ? +x : null);
+      out = p
+        ? {
+            available: true,
+            keyshop: num(p.currentKeyshops),
+            retail: num(p.currentRetail),
+            histKeyshop: num(p.historicalKeyshops),
+            url: d.url || null,
+          }
+        : { available: false };
+    }
+  } catch (e) {
+    return json({ error: 'GG.deals-Abruf fehlgeschlagen: ' + e.message }, 502);
+  }
+
+  const res = json(out);
+  res.headers.set('Cache-Control', 'public, max-age=600'); // 10 Min Cache (schont Rate-Limit)
   ctx.waitUntil(cache.put(cacheKey, res.clone()));
   return res;
 }
@@ -176,6 +224,7 @@ async function buildDeals(key) {
     const rep = analyze(g.deals, REPUTABLE, histLow);
 
     results.push({
+      id,
       title: c.title,
       slug: c.slug,
       boxart: c.boxart || null,
@@ -243,10 +292,10 @@ const HTML = `<!doctype html>
 <title>Key Sniper</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e2330; --border:#2a3040;
-    --text:#e7ebf2; --muted:#8b93a7; --accent:#4ade80; --accent2:#38bdf8; --gold:#fbbf24; }
+    --text:#e7ebf2; --muted:#8b93a7; --accent:#4ade80; --accent2:#38bdf8; --gold:#fbbf24; --danger:#f87171; }
   @media (prefers-color-scheme: light) {
     :root { --bg:#f4f6fb; --panel:#fff; --panel2:#f0f3f9; --border:#dde3ee;
-      --text:#1a2233; --muted:#5b6474; --accent:#16a34a; --accent2:#0284c7; --gold:#d97706; } }
+      --text:#1a2233; --muted:#5b6474; --accent:#16a34a; --accent2:#0284c7; --gold:#d97706; --danger:#dc2626; } }
   * { box-sizing:border-box; }
   body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); line-height:1.4; }
   header { padding:22px 24px 14px; border-bottom:1px solid var(--border); }
@@ -284,7 +333,16 @@ const HTML = `<!doctype html>
   .row { display:flex; justify-content:space-between; align-items:baseline; margin-top:6px; gap:8px; }
   .buy { display:inline-block; margin-top:10px; padding:7px 13px; border-radius:9px; background:var(--accent); color:#04120a; font-weight:650; font-size:13px; text-decoration:none; }
   .buy:hover { filter:brightness(1.08); }
+  .ks { margin-top:9px; font-size:13px; }
+  .ksbtn { padding:5px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel2); color:var(--muted); font-size:12px; cursor:pointer; }
+  .ksbtn:hover { border-color:var(--accent2); color:var(--accent2); }
+  .ksbtn:disabled { opacity:.6; cursor:default; }
+  .ksinfo b { color:var(--gold); }
+  .ksinfo a { color:var(--accent2); }
+  .ksinfo.err { color:var(--danger); }
   .empty { text-align:center; padding:60px 20px; color:var(--muted); }
+  .credit { max-width:1100px; margin:0 auto; padding:0 24px 40px; color:var(--muted); font-size:12px; }
+  .credit a { color:var(--accent2); }
 </style>
 </head>
 <body>
@@ -315,6 +373,10 @@ const HTML = `<!doctype html>
     <p class="summary" id="summary"></p>
     <div class="grid" id="grid"></div>
   </div>
+  <footer class="credit">
+    Marktpreise: <a href="https://isthereanydeal.com" target="_blank" rel="noopener">IsThereAnyDeal</a>
+    · Keyshop-Preise: <a href="https://gg.deals" target="_blank" rel="noopener">GG.deals</a>
+  </footer>
 <script>
   var DATA = { deals: [], generatedAt: null, count: 0, country: 'DE' };
   function $(id){ return document.getElementById(id); }
@@ -384,6 +446,7 @@ const HTML = `<!doctype html>
         '<div class="row"><span class="price-main">'+eur(v.cheapest.price)+'</span><span class="prices">bei <b>'+esc(v.cheapest.shop)+'</b></span></div>'+
         '<div class="prices">Zweitbilligster: '+eur(v.second.price)+' bei '+esc(v.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
         '<a class="buy" href="'+esc(v.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
+        '<div class="ks" data-id="'+esc(r.id)+'"><button class="ksbtn" type="button">Keyshop-Preis (GG.deals)</button></div>'+
         '</div></div>'
       );
     }
@@ -410,6 +473,30 @@ const HTML = `<!doctype html>
   var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyRep','onlyLow','onlySteam'];
   for (var k=0;k<keys.length;k++){ ui[keys[k]].addEventListener('input', render); ui[keys[k]].addEventListener('change', render); }
   $('refresh').addEventListener('click', function(){ load(true); });
+
+  // Keyshop-Preis auf Abruf (GG.deals) – ein Klick lädt genau dieses Spiel
+  $('grid').addEventListener('click', async function(e){
+    var btn = e.target && e.target.closest ? e.target.closest('.ksbtn') : null;
+    if (!btn) return;
+    var box = btn.parentNode;
+    var id = box.getAttribute('data-id');
+    btn.disabled = true; btn.textContent = 'Lädt …';
+    try {
+      var res = await fetch('/api/keyshop?id=' + encodeURIComponent(id));
+      var d = await res.json();
+      if (d.error) throw new Error(d.error);
+      if (!d.available) { box.innerHTML = '<span class="ksinfo">Kein Keyshop-Preis (kein Steam-Spiel)</span>'; return; }
+      var parts = [];
+      if (d.keyshop != null) parts.push('Keyshop: <b>' + eur(d.keyshop) + '</b>');
+      if (d.retail != null) parts.push('offiziell: ' + eur(d.retail));
+      var link = d.url ? ' · <a href="' + esc(d.url) + '" target="_blank" rel="noopener">auf GG.deals →</a>' : '';
+      box.innerHTML = '<span class="ksinfo">' + (parts.join(' · ') || 'kein Preis') + link + '</span>';
+    } catch (err) {
+      btn.disabled = false; btn.textContent = 'Keyshop-Preis (GG.deals)';
+      box.insertAdjacentHTML('beforeend', '<span class="ksinfo err"> — Fehler</span>');
+    }
+  });
+
   load(false);
 </script>
 </body>
