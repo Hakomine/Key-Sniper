@@ -2,7 +2,7 @@ name: Genre-DB aktualisieren
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # täglich 06:00 UTC
+    - cron: "0 */6 * * *"   # alle 6 Stunden
   workflow_dispatch: {}
 
 permissions:
