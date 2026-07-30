@@ -1,5 +1,6 @@
-# Niemals hochladen: der API-Key
+# Niemals hochladen: die API-Keys
 key.txt
+ggkey.txt
 
 # Generierte Daten (baut der Workflow / lokaler Lauf frisch)
 deals.js
