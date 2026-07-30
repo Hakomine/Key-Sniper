@@ -1,0 +1,7 @@
+# Nur nötig, wenn du per CLI (wrangler) deployen willst.
+# Einfacher Weg ist das Cloudflare-Dashboard (siehe README).
+name = "key-sniper"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Key danach setzen mit:  wrangler secret put ITAD_API_KEY

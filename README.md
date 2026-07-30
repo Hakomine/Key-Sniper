@@ -28,6 +28,18 @@ git branch -M main
 git push -u origin main
 ```
 
+## Live hosten (Cloudflare Workers, kostenlos) — empfohlen
+Holt die Deals **live beim Öffnen/Aktualisieren**, Key bleibt geheim, direkte Shop-Links.
+
+1. Kostenlosen Account: <https://dash.cloudflare.com>
+2. **Workers & Pages → Create → Workers → Create Worker** → Name `key-sniper` → Deploy.
+3. **Edit code** → gesamten Inhalt von `worker.js` einfügen → **Deploy**.
+4. **Settings → Variables and Secrets → Add** → Type *Secret*:
+   - Name: `ITAD_API_KEY`, Wert: dein Key → speichern → **Deploy**.
+5. Worker-URL öffnen: `https://key-sniper.DEIN-SUBDOMAIN.workers.dev`
+
+Alternativ per CLI: `npm i -g wrangler`, dann `wrangler deploy` und `wrangler secret put ITAD_API_KEY`.
+
 ## Dateien
 - `collector.mjs` – holt & filtert die Deals, schreibt `deals.js`
 - `Key Sniper.html` – die App (Live-Filter für Preislücke, Max-Preis, Historical Low)
