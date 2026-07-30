@@ -20,8 +20,8 @@ const CACHE_SECONDS = 120; // Serverseitiger Cache fürs Live-Holen
 // Keyshop-Radar: die N beliebtesten Steam-Spiele auf Keyshop-Deals abklopfen
 const RADAR_UNIVERSE = 100;      // 100 = ein GG.deals-Block (Rate-Limit-konform)
 const RADAR_CACHE = 1500;        // 25 Min Cache (frisch genug, schont Limit)
-const RADAR_NEAR_LOW_PCT = 15;   // "auf Keyshop-Tief", wenn <= ATL * (1 + 15%)
-const RADAR_MIN_SAVING = 15;     // min. % günstiger als offizieller Preis
+const RADAR_NEAR_LOW_PCT = 15;   // "auf Keyshop-Tief"-Badge, wenn <= 15% über ATL
+const RADAR_MAX_OVER_LOW = 30;   // Aufnahme, wenn Keyshop <= 30% über Keyshop-Allzeittief
 
 const numPos = (x) => (x != null && +x > 0 ? +x : null);
 
@@ -205,13 +205,14 @@ async function handleRadar(url, env, ctx) {
       const retail = numPos(d.prices.currentRetail);
       const ksLow = numPos(d.prices.historicalKeyshops);
       if (!ks) continue;
-      const atKsLow = ksLow != null && ks <= ksLow * (1 + RADAR_NEAR_LOW_PCT / 100);
-      const savingAbs = retail != null ? +(retail - ks).toFixed(2) : null;
+      // Vergleich Keyshop-gegen-Keyshop: wie weit über dem eigenen Allzeittief?
+      const overLowPct = ksLow != null ? Math.round((ks / ksLow - 1) * 100) : null;
+      if (overLowPct == null || overLowPct > RADAR_MAX_OVER_LOW) continue;
+      const atKsLow = overLowPct <= RADAR_NEAR_LOW_PCT;
       const savingPct = retail != null ? Math.round((1 - ks / retail) * 100) : null;
-      if (!atKsLow && !(savingPct != null && savingPct >= RADAR_MIN_SAVING)) continue;
-      deals.push({ appid: +appid, title: d.title, keyshop: ks, retail, ksLow, savingAbs, savingPct, atKsLow, url: d.url || null });
+      deals.push({ appid: +appid, title: d.title, keyshop: ks, retail, ksLow, overLowPct, savingPct, atKsLow, url: d.url || null });
     }
-    deals.sort((a, b) => (b.savingAbs || 0) - (a.savingAbs || 0));
+    deals.sort((a, b) => a.overLowPct - b.overLowPct); // am nächsten am Keyshop-Tief zuerst
     out = { generatedAt: new Date().toISOString(), universe: RADAR_UNIVERSE, count: deals.length, deals };
   } catch (e) {
     return json({ error: 'Radar fehlgeschlagen: ' + e.message }, 502);
@@ -488,18 +489,20 @@ const HTML = `<!doctype html>
       var d = new Date(RADAR.generatedAt);
       $('meta').textContent = 'Radar-Stand: ' + d.toLocaleTimeString('de-DE') + ' · ' + RADAR.deals.length + ' Keyshop-Deals';
     }
-    $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den beliebtesten Spielen – nach Ersparnis sortiert';
+    $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den beliebtesten Spielen – nach Abstand zum Keyshop-Allzeittief sortiert';
     var out = [];
     for (var i=0;i<RADAR.deals.length;i++){
       var r = RADAR.deals[i];
-      var low = r.atKsLow ? '<span class="badge low">📉 Keyshop-Tief</span>' : '';
-      var sav = r.savingPct != null ? '<span class="badge gap">−'+r.savingPct+'% ggü. offiziell</span>' : '<span class="badge gap">Keyshop-Deal</span>';
+      var over = (r.overLowPct != null && r.overLowPct <= 0)
+        ? '<span class="badge low">🔥 Keyshop-Allzeittief</span>'
+        : '<span class="' + (r.atKsLow ? 'badge low' : 'badge gap') + '">' + r.overLowPct + '% über Keyshop-Tief</span>';
+      var sav = (r.savingPct != null && r.savingPct > 0) ? '<span class="badge">−'+r.savingPct+'% ggü. offiziell</span>' : '';
       out.push(
         '<div class="card"><div class="body">'+
         '<p class="title">'+esc(r.title)+'</p>'+
-        '<div class="badges">'+sav+low+'</div>'+
+        '<div class="badges">'+over+sav+'</div>'+
         '<div class="row"><span class="price-main">'+eur(r.keyshop)+'</span><span class="prices">Keyshop (Grau-Markt)</span></div>'+
-        '<div class="prices">'+(r.retail!=null?'offiziell: '+eur(r.retail):'')+(r.ksLow!=null?' · Keyshop-Tief '+eur(r.ksLow):'')+'</div>'+
+        '<div class="prices">Keyshop-Allzeittief: '+eur(r.ksLow)+(r.retail!=null?' · offiziell: '+eur(r.retail):'')+'</div>'+
         (r.url ? '<a class="buy" href="'+esc(r.url)+'" target="_blank" rel="noopener">auf GG.deals →</a>' : '')+
         '</div></div>'
       );
