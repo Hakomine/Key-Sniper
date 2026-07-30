@@ -5,7 +5,7 @@ ggkey.txt
 # Generierte Daten (baut der Workflow / lokaler Lauf frisch)
 deals.js
 keyshop-deals.json
-genres-db.json
+# genres-db.json wird bewusst committet (Worker liest sie für Genres)
 
 # Node
 node_modules/

@@ -105,7 +105,7 @@ async function handleDeals(request, env, ctx) {
 
   let data;
   try {
-    data = await buildDeals(key);
+    data = await buildDeals(env);
   } catch (e) {
     return json({ error: 'ITAD-Abruf fehlgeschlagen: ' + e.message }, 502);
   }
@@ -224,8 +224,21 @@ async function handleRadar(url, env, ctx) {
   return res;
 }
 
-async function buildDeals(key) {
+async function buildDeals(env) {
+  const key = env.ITAD_API_KEY;
   const LIMIT = 200;
+
+  // Genre-DB (optional) laden – für den Genre-Filter (aus GENRES_URL, 1h gecached)
+  const genreMap = new Map();
+  if (env.GENRES_URL) {
+    try {
+      const gr = await fetch(env.GENRES_URL, { cf: { cacheTtl: 3600, cacheEverything: true } });
+      if (gr.ok) {
+        const gdb = await gr.json();
+        for (const k in gdb) genreMap.set(k, gdb[k]);
+      }
+    } catch {}
+  }
 
   // 1) Deals (tiefste Rabatte) UND beliebteste Spiele parallel holen
   const dealsPromise = (async () => {
@@ -300,6 +313,7 @@ async function buildDeals(key) {
       boxart: 'https://assets.isthereanydeal.com/' + id + '/boxart.jpg',
       histLow,
       pop: popMap.get(id) || 0,
+      tags: genreMap.get(id) || [],
       itadUrl: 'https://isthereanydeal.com/game/' + c.slug + '/info/',
       all,
       rep,
@@ -436,6 +450,25 @@ const HTML = `<!doctype html>
         <option value="price">Billigster Preis</option>
         <option value="title">Name (A–Z)</option>
       </select></div>
+      <div class="ctrl"><label>Genre</label><select id="genre">
+        <option value="">Alle Genres</option>
+        <option value="action">Action</option>
+        <option value="shooter">Shooter / FPS</option>
+        <option value="rpg">RPG</option>
+        <option value="rogue">Roguelike / -lite</option>
+        <option value="strateg">Strategie</option>
+        <option value="indie">Indie</option>
+        <option value="adventure">Adventure</option>
+        <option value="simulat">Simulation</option>
+        <option value="horror">Horror</option>
+        <option value="metroidvania">Metroidvania</option>
+        <option value="souls">Souls-like</option>
+        <option value="racing">Rennspiel</option>
+        <option value="sport">Sport</option>
+        <option value="puzzle">Puzzle</option>
+        <option value="open world">Open World</option>
+        <option value="co-op">Koop / Multiplayer</option>
+      </select></div>
       <div class="ctrl"><label>Suche</label><input type="search" id="q" placeholder="Spielname ..." /></div>
       <div class="ctrl">
         <label class="toggle"><input type="checkbox" id="onlyRep" /> Nur seriöse Stores</label>
@@ -456,8 +489,17 @@ const HTML = `<!doctype html>
   function eur(n){ return n==null ? '–' : n.toLocaleString('de-DE',{style:'currency',currency:'EUR'}); }
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
-  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
+  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), genre:$('genre'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
   var RADAR = { deals: [], generatedAt: null, loaded: false, loading: false };
+  var GENRE_KW = { shooter:['shooter','fps'], 'co-op':['co-op','coop','multiplayer'] };
+  function matchGenre(tags, cat){
+    if (!cat) return true;
+    if (!tags || !tags.length) return false;
+    var hay = tags.join(' ').toLowerCase();
+    var kws = GENRE_KW[cat] || [cat];
+    for (var i=0;i<kws.length;i++) if (hay.indexOf(kws[i]) !== -1) return true;
+    return false;
+  }
 
   function setMeta(){
     if (DATA.generatedAt){
@@ -517,6 +559,7 @@ const HTML = `<!doctype html>
     var gapPct = parseInt(ui.gapPct.value, 10);
     var maxPrice = parseInt(ui.maxPrice.value, 10);
     var q = ui.q.value.trim().toLowerCase();
+    var genre = ui.genre.value;
     var onlyRep = ui.onlyRep.checked;
     var onlyLow = ui.onlyLow.checked;
     var onlySteam = ui.onlySteam.checked;
@@ -538,6 +581,7 @@ const HTML = `<!doctype html>
       if (maxPrice > 0 && x.v.cheapest.price > maxPrice) return false;
       if (onlyLow && !x.v.atHistLow) return false;
       if (onlySteam && !x.v.cheapest.steam) return false;
+      if (genre && !matchGenre(x.r.tags, genre)) return false;
       if (q && x.r.title.toLowerCase().indexOf(q) === -1) return false;
       return true;
     });
@@ -590,7 +634,7 @@ const HTML = `<!doctype html>
     setMeta(); render();
   }
 
-  var keys = ['gapAbs','gapPct','maxPrice','sort','q','onlyRep','onlyLow','onlySteam'];
+  var keys = ['gapAbs','gapPct','maxPrice','sort','genre','q','onlyRep','onlyLow','onlySteam'];
   for (var k=0;k<keys.length;k++){ ui[keys[k]].addEventListener('input', render); ui[keys[k]].addEventListener('change', render); }
   $('refresh').addEventListener('click', function(){ if ($('radar').checked) loadRadar(true); else load(true); });
 
