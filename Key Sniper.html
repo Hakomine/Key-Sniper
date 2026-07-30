@@ -100,6 +100,28 @@
         </select>
       </div>
       <div class="ctrl">
+        <label>Genre</label>
+        <select id="genre">
+          <option value="">Alle Genres</option>
+          <option value="action">Action</option>
+          <option value="shooter">Shooter / FPS</option>
+          <option value="rpg">RPG</option>
+          <option value="rogue">Roguelike / -lite</option>
+          <option value="strateg">Strategie</option>
+          <option value="indie">Indie</option>
+          <option value="adventure">Adventure</option>
+          <option value="simulat">Simulation</option>
+          <option value="horror">Horror</option>
+          <option value="metroidvania">Metroidvania</option>
+          <option value="souls">Souls-like</option>
+          <option value="racing">Rennspiel</option>
+          <option value="sport">Sport</option>
+          <option value="puzzle">Puzzle</option>
+          <option value="open world">Open World</option>
+          <option value="co-op">Koop / Multiplayer</option>
+        </select>
+      </div>
+      <div class="ctrl">
         <label>Suche</label>
         <input type="search" id="q" placeholder="Spielname ..." />
       </div>
@@ -130,14 +152,28 @@
 
   const ui = {
     gapAbs: $("gapAbs"), gapPct: $("gapPct"), maxPrice: $("maxPrice"),
-    sort: $("sort"), q: $("q"), onlyRep: $("onlyRep"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
+    sort: $("sort"), genre: $("genre"), q: $("q"), onlyRep: $("onlyRep"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
   };
+
+  // Genre-Kategorie -> passende Tag-Stichwörter (Tags kleingeschrieben durchsucht)
+  const GENRE_KW = {
+    shooter: ["shooter", "fps"],
+    "co-op": ["co-op", "coop", "multiplayer"],
+  };
+  function matchGenre(tags, cat) {
+    if (!cat) return true;
+    if (!tags || !tags.length) return false;
+    const hay = tags.join(" ").toLowerCase();
+    const kws = GENRE_KW[cat] || [cat];
+    return kws.some((k) => hay.includes(k));
+  }
 
   function render() {
     const gapAbs = parseFloat(ui.gapAbs.value);
     const gapPct = parseInt(ui.gapPct.value, 10);
     const maxPrice = parseInt(ui.maxPrice.value, 10);
     const q = ui.q.value.trim().toLowerCase();
+    const genre = ui.genre.value;
     const onlyRep = ui.onlyRep.checked;
     const onlyLow = ui.onlyLow.checked;
     const onlySteam = ui.onlySteam.checked;
@@ -173,6 +209,7 @@
       if (maxPrice > 0 && v.cheapest.price > maxPrice) return false;
       if (onlyLow && !v.atHistLow) return false;
       if (onlySteam && !v.cheapest.steam) return false;
+      if (genre && !matchGenre(r.tags, genre)) return false;
       if (q && !r.title.toLowerCase().includes(q)) return false;
       return true;
     });

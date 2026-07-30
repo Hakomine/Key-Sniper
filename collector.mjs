@@ -201,6 +201,43 @@ async function fetchPopular() {
   }
 }
 
+// Persistente Genre-Datenbank (uuid -> tags[]). Nur neue Spiele werden geholt,
+// Genres ändern sich fast nie -> nach dem ersten Aufbau ist das ruckzuck.
+const DB_PATH = path.join(__dirname, 'genres-db.json');
+function loadDb() {
+  try {
+    return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+async function enrichGenres(results) {
+  const db = loadDb();
+  const need = [...new Set(results.map((r) => r.id))].filter((id) => !(id in db));
+  if (need.length) {
+    console.log(`  Hole Genres für ${need.length} neue Spiele (einmalig, dauert etwas) ...`);
+    let i = 0;
+    let done = 0;
+    const worker = async () => {
+      while (i < need.length) {
+        const id = need[i++];
+        try {
+          const info = await api('/games/info/v2', { query: { id } });
+          db[id] = Array.isArray(info.tags) ? info.tags : [];
+        } catch {
+          db[id] = [];
+        }
+        done++;
+        if (done % 100 === 0) console.log(`  ... ${done}/${need.length} Genres geholt`);
+        await sleep(800);
+      }
+    };
+    await Promise.all(Array.from({ length: 3 }, worker));
+    fs.writeFileSync(DB_PATH, JSON.stringify(db));
+  }
+  for (const r of results) r.tags = db[r.id] || [];
+}
+
 async function main() {
   console.log(`\n  Key Sniper – Land: ${COUNTRY}`);
   console.log('  Sammle marktweite Deals ...');
@@ -248,6 +285,7 @@ async function main() {
     const rep = analyze(g.deals, REPUTABLE, histLow, tol);
 
     results.push({
+      id,
       title: c.title,
       slug: c.slug,
       type: c.type,
@@ -262,6 +300,9 @@ async function main() {
 
   console.log(`  Löse direkte Shop-Links auf ...`);
   await resolveAll(results);
+
+  console.log('  Genres/Tags aktualisieren ...');
+  await enrichGenres(results);
 
   results.sort((a, b) => b.all.gapAbs - a.all.gapAbs);
 

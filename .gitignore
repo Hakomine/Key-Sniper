@@ -4,6 +4,8 @@ ggkey.txt
 
 # Generierte Daten (baut der Workflow / lokaler Lauf frisch)
 deals.js
+keyshop-deals.json
+genres-db.json
 
 # Node
 node_modules/
