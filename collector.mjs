@@ -149,21 +149,55 @@ async function pricesFor(ids) {
   return out;
 }
 
+// 3) Beliebtheit (ITAD-count = Wunschlisten + Sammlungen), Top 500
+async function fetchPopular() {
+  try {
+    const list = await api('/stats/most-popular/v1', { query: { limit: 500 } });
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
 async function main() {
   console.log(`\n  Key Sniper – Land: ${COUNTRY}`);
   console.log('  Sammle marktweite Deals ...');
-  const candidates = await collectCandidates();
-  console.log(`  ${candidates.length} Deal-Kandidaten geladen.`);
+  const dealItems = await collectCandidates();
+  console.log(`  ${dealItems.length} Deal-Kandidaten geladen.`);
+
+  console.log('  Hole Beliebtheit ...');
+  const popList = await fetchPopular();
+  const popMap = new Map();
+  for (const g of popList) if (g && g.id) popMap.set(g.id, g.count || 0);
+
+  // Kandidaten-Metadaten aus beiden Quellen (Deals reicher: boxart/regular; Beliebte ergänzen)
+  const meta = new Map();
+  for (const c of dealItems) {
+    if (!meta.has(c.id)) {
+      meta.set(c.id, {
+        title: c.title,
+        slug: c.slug,
+        type: c.type,
+        boxart: c.assets?.boxart || c.assets?.banner300 || null,
+        regular: c.regular?.amount ?? null,
+      });
+    }
+  }
+  for (const g of popList) {
+    if (g && g.id && !meta.has(g.id)) meta.set(g.id, { title: g.title, slug: g.slug, type: g.type, boxart: null, regular: null });
+  }
+  const ids = [...meta.keys()];
 
   console.log('  Hole Shop-Preise + Historical Low ...');
-  const prices = await pricesFor(candidates.map((c) => c.id));
+  const prices = await pricesFor(ids);
 
   const tol = CFG.histLowTolerancePct ?? 5;
   const results = [];
 
-  for (const c of candidates) {
-    const g = prices[c.id];
+  for (const id of ids) {
+    const g = prices[id];
     if (!g) continue;
+    const c = meta.get(id);
 
     // Nur seriöse Shops, pro Shop den billigsten Preis behalten
     const byShop = new Map();
@@ -186,15 +220,16 @@ async function main() {
       title: c.title,
       slug: c.slug,
       type: c.type,
-      boxart: c.assets?.boxart || c.assets?.banner300 || null,
+      boxart: c.boxart || null,
       cheapest: { shop: p0.shop.name, price: p0.price.amount, cut: p0.cut, url: p0.url },
       second: { shop: p1.shop.name, price: p1.price.amount },
-      regular: p0.regular?.amount ?? c.regular?.amount ?? null,
+      regular: p0.regular?.amount ?? c.regular ?? null,
       currency: p0.price.currency || 'EUR',
       gapAbs,
       gapPct,
       histLow,
       atHistLow,
+      pop: popMap.get(id) || 0,
       trustedCount: sorted.length,
       itadUrl: `https://isthereanydeal.com/game/${c.slug}/info/`,
     });

@@ -93,6 +93,7 @@
         <select id="sort">
           <option value="gapAbs">Größte Lücke (€)</option>
           <option value="gapPct">Größte Lücke (%)</option>
+          <option value="pop">Beliebtheit</option>
           <option value="price">Billigster Preis</option>
           <option value="title">Name (A–Z)</option>
         </select>
@@ -153,6 +154,7 @@
     list.sort((a, b) => {
       if (s === "gapAbs") return b.gapAbs - a.gapAbs;
       if (s === "gapPct") return b.gapPct - a.gapPct;
+      if (s === "pop") return (b.pop || 0) - (a.pop || 0) || (b.gapAbs - a.gapAbs);
       if (s === "price") return a.cheapest.price - b.cheapest.price;
       if (s === "title") return a.title.localeCompare(b.title);
       return 0;

@@ -65,23 +65,51 @@ async function handleDeals(request, env, ctx) {
 
 async function buildDeals(key) {
   const LIMIT = 200;
-  let offset = 0;
-  const cands = [];
-  while (cands.length < MAX_GAMES) {
-    const page = await itad('/deals/v2', {
-      query: { country: COUNTRY, offset, limit: LIMIT, sort: '-cut' },
-      key,
-    });
-    const list = Array.isArray(page) ? page : page.list || [];
-    if (list.length === 0) break;
-    cands.push(...list);
-    const more = Array.isArray(page) ? list.length === LIMIT : page.hasMore ?? list.length === LIMIT;
-    if (!more) break;
-    offset += LIMIT;
-  }
-  const candidates = cands.slice(0, MAX_GAMES);
-  const ids = candidates.map((c) => c.id);
 
+  // 1) Deals (tiefste Rabatte) UND beliebteste Spiele parallel holen
+  const dealsPromise = (async () => {
+    let offset = 0;
+    const cands = [];
+    while (cands.length < MAX_GAMES) {
+      const page = await itad('/deals/v2', {
+        query: { country: COUNTRY, offset, limit: LIMIT, sort: '-cut' },
+        key,
+      });
+      const list = Array.isArray(page) ? page : page.list || [];
+      if (list.length === 0) break;
+      cands.push(...list);
+      const more = Array.isArray(page) ? list.length === LIMIT : page.hasMore ?? list.length === LIMIT;
+      if (!more) break;
+      offset += LIMIT;
+    }
+    return cands.slice(0, MAX_GAMES);
+  })();
+  const [dealItems, popular] = await Promise.all([
+    dealsPromise,
+    itad('/stats/most-popular/v1', { query: { limit: 500 }, key }).catch(() => []),
+  ]);
+  const popList = Array.isArray(popular) ? popular : [];
+  const popMap = new Map();
+  for (const g of popList) if (g && g.id) popMap.set(g.id, g.count || 0);
+
+  // 2) Kandidaten-Metadaten aus beiden Quellen zusammenführen (Deals sind reicher: boxart/regular)
+  const meta = new Map();
+  for (const c of dealItems) {
+    if (!meta.has(c.id)) {
+      meta.set(c.id, {
+        title: c.title,
+        slug: c.slug,
+        boxart: (c.assets && (c.assets.boxart || c.assets.banner300)) || null,
+        regular: c.regular && c.regular.amount,
+      });
+    }
+  }
+  for (const g of popList) {
+    if (g && g.id && !meta.has(g.id)) meta.set(g.id, { title: g.title, slug: g.slug, boxart: null, regular: null });
+  }
+  const ids = [...meta.keys()];
+
+  // 3) Preise für alle Kandidaten
   const batches = [];
   for (let i = 0; i < ids.length; i += 200) batches.push(ids.slice(i, i + 200));
   const priceLists = await Promise.all(
@@ -92,10 +120,12 @@ async function buildDeals(key) {
   const prices = {};
   for (const arr of priceLists) for (const g of arr) prices[g.id] = g;
 
+  // 4) Analyse
   const results = [];
-  for (const c of candidates) {
-    const g = prices[c.id];
+  for (const id of ids) {
+    const g = prices[id];
     if (!g) continue;
+    const c = meta.get(id);
 
     const byShop = new Map();
     for (const d of g.deals || []) {
@@ -116,7 +146,7 @@ async function buildDeals(key) {
     results.push({
       title: c.title,
       slug: c.slug,
-      boxart: (c.assets && (c.assets.boxart || c.assets.banner300)) || null,
+      boxart: c.boxart || null,
       cheapest: {
         shop: p0.shop.name,
         price: p0.price.amount,
@@ -124,11 +154,12 @@ async function buildDeals(key) {
         url: '/go?u=' + encodeURIComponent(p0.url),
       },
       second: { shop: p1.shop.name, price: p1.price.amount },
-      regular: (p0.regular && p0.regular.amount) ?? (c.regular && c.regular.amount) ?? null,
+      regular: (p0.regular && p0.regular.amount) ?? c.regular ?? null,
       gapAbs,
       gapPct,
       histLow,
       atHistLow,
+      pop: popMap.get(id) || 0,
       itadUrl: 'https://isthereanydeal.com/game/' + c.slug + '/info/',
     });
   }
@@ -251,6 +282,7 @@ const HTML = `<!doctype html>
       <div class="ctrl"><label>Sortierung</label><select id="sort">
         <option value="gapAbs">Größte Lücke (€)</option>
         <option value="gapPct">Größte Lücke (%)</option>
+        <option value="pop">Beliebtheit</option>
         <option value="price">Billigster Preis</option>
         <option value="title">Name (A–Z)</option>
       </select></div>
@@ -297,6 +329,7 @@ const HTML = `<!doctype html>
     list.sort(function(a,b){
       if (s==='gapAbs') return b.gapAbs - a.gapAbs;
       if (s==='gapPct') return b.gapPct - a.gapPct;
+      if (s==='pop') return (b.pop||0) - (a.pop||0) || (b.gapAbs - a.gapAbs);
       if (s==='price') return a.cheapest.price - b.cheapest.price;
       if (s==='title') return a.title.localeCompare(b.title);
       return 0;
