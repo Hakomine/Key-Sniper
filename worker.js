@@ -45,6 +45,17 @@ const ALARM_TTL = 14 * 24 * 3600; // so lange gilt ein Deal als "schon gemeldet"
 const ALARM_REDROP_PCT = 10;    // erneut melden, wenn Preis nochmal 10% fällt
 const ALARM_MAX_EMBEDS = 10;    // Discord erlaubt max. 10 Embeds pro Nachricht
 
+// Wächter: merkt, wenn der Cron stirbt oder eine API ausfällt
+const HEALTH_TTL = 7 * 24 * 3600;
+const ERROR_COOLDOWN = 3600;    // Fehler höchstens 1x pro Stunde melden
+const REPORT_HOUR_UTC = 7;      // Tagesbericht ab dieser UTC-Stunde (~9 Uhr DE)
+
+// Content-Grafiken
+const BRAND = 'Hakomine';       // Wasserzeichen auf den Post-Grafiken
+const IMG_HOSTS = ['assets.isthereanydeal.com', 'cdn.cloudflare.steamstatic.com'];
+// Reihenfolge der Cover-Varianten: viele Spiele haben kein boxart, aber ein banner
+const COVER_VARIANTS = ['boxart', 'banner600', 'banner400'];
+
 const numPos = (x) => (x != null && +x > 0 ? +x : null);
 
 // Seriöse Stores (Häkchen "Nur seriöse Stores" nutzt nur diese)
@@ -103,6 +114,13 @@ export default {
     if (url.pathname === '/api/deals') return handleDeals(request, env, ctx);
     if (url.pathname === '/api/keyshop') return handleKeyshop(url, env, ctx);
     if (url.pathname === '/api/radar') return handleRadar(url, env, ctx);
+    if (url.pathname === '/api/health') return handleHealth(env);
+    if (url.pathname === '/img') return handleImg(url);
+    if (url.pathname === '/overlay') {
+      return new Response(OVERLAY_HTML, {
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
+    }
     if (url.pathname === '/go') return handleGo(url);
     return new Response(HTML, {
       headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -446,22 +464,134 @@ async function handleGo(url) {
   return Response.redirect(await resolveStoreUrl(target), 302);
 }
 
+// ---------- Wächter: Zustand nach außen sichtbar machen ----------
+// Der externe Watchdog (GitHub Action) fragt das ab. Ein toter Worker kann sich
+// nicht selbst melden – deshalb schaut jemand von außen auf das Alter.
+async function handleHealth(env) {
+  const raw = await store.get(env, 'health');
+  if (!raw) return json({ ok: false, reason: 'noch kein Cron-Lauf verzeichnet' }, 503);
+  let h;
+  try {
+    h = JSON.parse(raw);
+  } catch {
+    return json({ ok: false, reason: 'Zustand unlesbar' }, 503);
+  }
+  const ageMinutes = Math.round((Date.now() - new Date(h.at).getTime()) / 60000);
+  return json({ ...h, ageMinutes });
+}
+
+// ---------- Bild-Proxy für die Post-Grafiken ----------
+// Ohne diesen Umweg wäre das Canvas "tainted" (fremde Domain) und der Download
+// würde scheitern. Bewusst nur eine feste Host-Liste – kein offener Proxy.
+async function handleImg(url) {
+  const target = url.searchParams.get('u');
+  if (!target) return new Response('missing u', { status: 400 });
+  let host;
+  try {
+    host = new URL(target).hostname;
+  } catch {
+    return new Response('bad url', { status: 400 });
+  }
+  if (!IMG_HOSTS.includes(host)) return new Response('host not allowed', { status: 403 });
+
+  // Nicht jedes Spiel hat ein "boxart" – ITAD liefert dann HTTP 200 mit einer
+  // XML-Fehlermeldung statt 404. Deshalb Inhaltstyp prüfen und Varianten durchgehen.
+  let candidates = [target];
+  const m = target.match(/^(https:\/\/assets\.isthereanydeal\.com\/[^/]+\/)(?:boxart|banner600|banner400|banner300)\.jpg/);
+  if (m) candidates = COVER_VARIANTS.map((v) => m[1] + v + '.jpg');
+
+  for (const c of candidates) {
+    const upstream = await fetch(c, { cf: { cacheTtl: 86400, cacheEverything: true } });
+    const ct = upstream.headers.get('content-type') || '';
+    if (!upstream.ok || !ct.startsWith('image/')) continue;
+    const res = new Response(upstream.body, upstream);
+    res.headers.set('Cache-Control', 'public, max-age=86400');
+    res.headers.set('Access-Control-Allow-Origin', '*');
+    return res;
+  }
+  return new Response('kein Bild vorhanden', { status: 404 });
+}
+
 // ---------- Cron: Alarm melden + Radar rotierend füllen ----------
 
 async function runCron(env) {
   const alerts = [];
+  const errors = [];
+  let checked = 0;
+
   try {
-    alerts.push(...(await alarmDeals(env)));
+    const hits = await alarmDeals(env);
+    checked += ALARM_SCAN;
+    alerts.push(...hits);
   } catch (e) {
-    console.log('Alarm-Check fehlgeschlagen: ' + e.message);
+    errors.push('Alarm-Check: ' + e.message);
   }
   try {
-    alerts.push(...(await rotateRadar(env)));
+    const hits = await rotateRadar(env);
+    checked += RADAR_BLOCK;
+    alerts.push(...hits);
   } catch (e) {
-    console.log('Radar-Rotation fehlgeschlagen: ' + e.message);
+    errors.push('Radar: ' + e.message);
   }
+
   if (alerts.length) await sendDiscord(env, alerts);
-  console.log('Cron fertig – ' + alerts.length + ' neue Alarme');
+
+  // Zustand festhalten – daran erkennt der externe Watchdog, ob es noch lebt
+  const ok = errors.length === 0;
+  await store.put(
+    env,
+    'health',
+    JSON.stringify({ at: new Date().toISOString(), ok, checked, alerts: alerts.length, error: errors.join(' | ') || null }),
+    HEALTH_TTL
+  );
+
+  if (!ok) await reportError(env, errors);
+  else await dailyReport(env, checked, alerts.length);
+
+  console.log('Cron fertig – ' + alerts.length + ' neue Alarme' + (ok ? '' : ' | FEHLER: ' + errors.join(' | ')));
+}
+
+// Fehler melden, aber höchstens 1x pro Stunde (sonst pingt ein dauerhaft
+// kaputter Dienst alle 10 Minuten).
+async function reportError(env, errors) {
+  const last = +(await store.get(env, 'error_cooldown')) || 0;
+  if (Date.now() - last < ERROR_COOLDOWN * 1000) return;
+  await store.put(env, 'error_cooldown', String(Date.now()), ERROR_COOLDOWN * 2);
+  await sendDiscordRaw(env, {
+    username: 'Key Sniper',
+    content: '⚠️ **Key Sniper hat ein Problem**',
+    embeds: [
+      {
+        title: 'Cron-Lauf fehlgeschlagen',
+        description: errors.map((e) => '• ' + e).join('\n').slice(0, 3900),
+        color: 16007990,
+        footer: { text: 'Nächste Meldung frühestens in einer Stunde' },
+      },
+    ],
+  });
+}
+
+// Einmal am Tag ein Lebenszeichen – so fällt Stille auch dann auf,
+// wenn gerade wirklich keine Deals da sind.
+async function dailyReport(env, checked, alerts) {
+  const now = new Date();
+  if (now.getUTCHours() < REPORT_HOUR_UTC) return;
+  const today = now.toISOString().slice(0, 10);
+  if ((await store.get(env, 'daily_report')) === today) return;
+  await store.put(env, 'daily_report', today, 3 * 24 * 3600);
+  await sendDiscordRaw(env, {
+    username: 'Key Sniper',
+    embeds: [
+      {
+        title: '✅ Key Sniper läuft',
+        description:
+          'Gerade ' + checked + ' Spiele geprüft.' +
+          (alerts ? ' ' + alerts + ' neue Treffer dabei.' : ' Aktuell nichts Neues.'),
+        color: 4906624,
+        footer: { text: 'Tägliches Lebenszeichen' },
+      },
+    ],
+  });
 }
 
 // Schlanker Alarm-Pfad (2 API-Calls, wenig CPU).
@@ -609,17 +739,92 @@ async function sendDiscord(env, hits) {
   );
 
   const more = hits.length > ALARM_MAX_EMBEDS ? ' (+' + (hits.length - ALARM_MAX_EMBEDS) + ' weitere)' : '';
-  const res = await fetch(hook, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      username: 'Key Sniper',
-      content: '🎯 **' + hits.length + (hits.length === 1 ? ' neuer Deal' : ' neue Deals') + '**' + more,
-      embeds,
-    }),
+  await sendDiscordRaw(env, {
+    username: 'Key Sniper',
+    content: '🎯 **' + hits.length + (hits.length === 1 ? ' neuer Deal' : ' neue Deals') + '**' + more,
+    embeds,
   });
-  if (!res.ok) console.log('Discord HTTP ' + res.status);
 }
+
+// Gemeinsamer Versandweg für Alarm, Fehlermeldung und Tagesbericht
+async function sendDiscordRaw(env, payload) {
+  const hook = env.DISCORD_WEBHOOK;
+  if (!hook) return;
+  try {
+    const res = await fetch(hook, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) console.log('Discord HTTP ' + res.status);
+  } catch (e) {
+    console.log('Discord-Versand fehlgeschlagen: ' + e.message);
+  }
+}
+
+// ---------- Stream-Overlay für OBS (Browser-Source) ----------
+// Transparenter Hintergrund, aktualisiert sich selbst. Parameter: ?n=5&gap=7
+const OVERLAY_HTML = `<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<title>Key Sniper – Overlay</title>
+<style>
+  html,body { margin:0; background:transparent; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:18px; }
+  .head { display:flex; align-items:center; gap:9px; margin-bottom:12px;
+    font-size:20px; font-weight:800; color:#4ade80; text-shadow:0 2px 6px rgba(0,0,0,.9); }
+  .row { display:flex; align-items:center; gap:12px; margin-bottom:9px; padding:10px 14px;
+    background:rgba(15,17,21,.82); border:1px solid rgba(74,222,128,.35); border-left:5px solid #4ade80;
+    border-radius:12px; box-shadow:0 4px 18px rgba(0,0,0,.5); max-width:520px; }
+  .cover { width:44px; height:66px; border-radius:6px; object-fit:cover; flex:0 0 auto; background:#1e2330; }
+  .info { flex:1; min-width:0; }
+  .name { font-size:17px; font-weight:700; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sub { font-size:13px; color:#9aa3b5; }
+  .price { font-size:24px; font-weight:800; color:#4ade80; white-space:nowrap; }
+  .low { color:#fbbf24; font-size:12px; font-weight:700; }
+</style>
+</head>
+<body>
+  <div class="head" id="head">🎯 KEY SNIPER · TOP DEALS</div>
+  <div id="list"></div>
+<script>
+  var q = new URLSearchParams(location.search);
+  var N = Math.min(+(q.get('n') || 5), 12);
+  var MINGAP = +(q.get('gap') || 5);
+  var eur = function(n){ return n==null ? '–' : n.toLocaleString('de-DE',{style:'currency',currency:'EUR'}); };
+  var esc = function(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); };
+
+  async function tick(){
+    try {
+      var d = await (await fetch('/api/deals')).json();
+      var items = [];
+      for (var i=0;i<(d.deals||[]).length;i++){
+        var r = d.deals[i], v = r.rep || r.all;
+        if (!v || v.gapAbs < MINGAP) continue;
+        items.push({ r: r, v: v });
+      }
+      items.sort(function(a,b){
+        return (b.v.atHistLow?1:0)-(a.v.atHistLow?1:0) || b.v.gapAbs-a.v.gapAbs;
+      });
+      var out = [];
+      for (var j=0;j<Math.min(N, items.length);j++){
+        var r = items[j].r, v = items[j].v;
+        out.push('<div class="row">' +
+          (r.boxart ? '<img class="cover" src="'+esc(r.boxart)+'" onerror="this.style.visibility=\\'hidden\\'">' : '<div class="cover"></div>') +
+          '<div class="info"><div class="name">'+esc(r.title)+'</div>' +
+          '<div class="sub">'+esc(v.cheapest.shop)+' · '+v.gapAbs+' € günstiger' +
+          (v.atHistLow ? ' <span class="low">📉 TIEFSTPREIS</span>' : '') + '</div></div>' +
+          '<div class="price">'+eur(v.cheapest.price)+'</div></div>');
+      }
+      document.getElementById('list').innerHTML = out.join('');
+    } catch (e) { /* stillschweigend – im Stream soll nichts kaputt aussehen */ }
+  }
+  tick();
+  setInterval(tick, 300000); // alle 5 Minuten
+</script>
+</body>
+</html>`;
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
@@ -691,6 +896,16 @@ const HTML = `<!doctype html>
   .empty { text-align:center; padding:60px 20px; color:var(--muted); }
   .credit { max-width:1100px; margin:0 auto; padding:0 24px 40px; color:var(--muted); font-size:12px; }
   .credit a { color:var(--accent2); }
+  .shotbtn { margin-top:9px; margin-left:8px; padding:7px 11px; border:1px solid var(--border); border-radius:9px; background:var(--panel2); color:var(--muted); font-size:13px; cursor:pointer; }
+  .shotbtn:hover { border-color:var(--accent); color:var(--accent); }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.75); display:none; align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal.open { display:flex; }
+  .modalbox { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:18px; max-width:min(94vw,460px); max-height:92vh; overflow:auto; text-align:center; }
+  .modalbox canvas { width:100%; max-width:340px; height:auto; border-radius:10px; background:#0f1115; }
+  .modalrow { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:12px; }
+  .modalrow button { padding:9px 14px; border-radius:9px; border:1px solid var(--border); background:var(--panel2); color:var(--text); font-size:14px; cursor:pointer; }
+  .modalrow button.prim { background:var(--accent); color:#04120a; border-color:var(--accent); font-weight:650; }
+  .modalrow button.on { border-color:var(--accent); color:var(--accent); }
 </style>
 </head>
 <body>
@@ -745,14 +960,41 @@ const HTML = `<!doctype html>
     Marktpreise: <a href="https://isthereanydeal.com" target="_blank" rel="noopener">IsThereAnyDeal</a>
     · Keyshop-Preise: <a href="https://gg.deals" target="_blank" rel="noopener">GG.deals</a>
   </footer>
+
+  <div class="modal" id="shotModal">
+    <div class="modalbox">
+      <canvas id="shotCanvas" width="1080" height="1920"></canvas>
+      <div class="modalrow">
+        <button type="button" id="fmt916" class="on">9:16 TikTok</button>
+        <button type="button" id="fmt11">1:1 Post</button>
+      </div>
+      <div class="modalrow">
+        <button type="button" id="shotDl" class="prim">Bild speichern</button>
+        <button type="button" id="shotClose">Schließen</button>
+      </div>
+    </div>
+  </div>
 <script>
   var DATA = { deals: [], generatedAt: null, count: 0, country: 'DE' };
   function $(id){ return document.getElementById(id); }
   function eur(n){ return n==null ? '–' : n.toLocaleString('de-DE',{style:'currency',currency:'EUR'}); }
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
+  // Viele Spiele haben kein "boxart", aber ein Banner – der Reihe nach durchprobieren
+  var COVER_VARIANTS = ['boxart','banner600','banner400'];
+  function coverFail(el){
+    var cur = el.getAttribute('data-v') || 'boxart';
+    var i = COVER_VARIANTS.indexOf(cur);
+    if (i > -1 && i < COVER_VARIANTS.length - 1) {
+      var nx = COVER_VARIANTS[i+1];
+      el.setAttribute('data-v', nx);
+      el.src = el.src.replace('/' + cur + '.jpg', '/' + nx + '.jpg');
+    } else { el.style.visibility = 'hidden'; }
+  }
+
   var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), genre:$('genre'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
   var RADAR = { deals: [], generatedAt: null, loaded: false, loading: false };
+  var SHOTS = [];   // Daten für die Post-Grafiken, wird beim Rendern gefüllt
   var GENRE_KW = { shooter:['shooter','fps'], 'co-op':['co-op','coop','multiplayer'] };
   function matchGenre(tags, cat){
     if (!cat) return true;
@@ -795,13 +1037,20 @@ const HTML = `<!doctype html>
     }
     $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den beliebtesten Spielen – nach Abstand zum Keyshop-Allzeittief sortiert';
     var out = [];
+    SHOTS = [];
     for (var i=0;i<RADAR.deals.length;i++){
       var r = RADAR.deals[i];
       var over = (r.overLowPct != null && r.overLowPct <= 0)
         ? '<span class="badge low">🔥 Keyshop-Allzeittief</span>'
         : '<span class="' + (r.atKsLow ? 'badge low' : 'badge gap') + '">' + r.overLowPct + '% über Keyshop-Tief</span>';
       var sav = (r.savingPct != null && r.savingPct > 0) ? '<span class="badge">−'+r.savingPct+'% ggü. offiziell</span>' : '';
-      var box = '<img class="box" src="https://cdn.cloudflare.steamstatic.com/steam/apps/'+r.appid+'/library_600x900.jpg" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">';
+      var cov = 'https://cdn.cloudflare.steamstatic.com/steam/apps/'+r.appid+'/library_600x900.jpg';
+      var box = '<img class="box" src="'+cov+'" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">';
+      var si = SHOTS.push({
+        title: r.title, price: r.keyshop, oldPrice: r.retail,
+        cutPct: r.savingPct, shop: 'Keyshop',
+        badge: (r.overLowPct != null && r.overLowPct <= 0) ? 'KEYSHOP-ALLZEITTIEF' : '', cover: cov,
+      }) - 1;
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title">'+esc(r.title)+'</p>'+
@@ -809,6 +1058,7 @@ const HTML = `<!doctype html>
         '<div class="row"><span class="price-main">'+eur(r.keyshop)+'</span><span class="prices">Keyshop (Grau-Markt)</span></div>'+
         '<div class="prices">Keyshop-Allzeittief: '+eur(r.ksLow)+(r.retail!=null?' · offiziell: '+eur(r.retail):'')+'</div>'+
         (r.url ? '<a class="buy" href="'+esc(r.url)+'" target="_blank" rel="noopener">auf GG.deals →</a>' : '')+
+        '<button class="shotbtn" type="button" data-shot="'+si+'" title="Bild für TikTok/Story">📸</button>'+
         '</div></div>'
       );
     }
@@ -859,12 +1109,18 @@ const HTML = `<!doctype html>
 
     $('summary').textContent = items.length + ' von ' + deals.length + ' Deals passen zu deinen Filtern' + (onlyRep ? ' (nur seriöse Stores)' : '');
     var out = [];
+    SHOTS = [];
     for (var i=0;i<items.length;i++){
       var r = items[i].r, v = items[i].v;
-      var box = r.boxart ? '<img class="box" src="'+esc(r.boxart)+'" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">' : '<div class="box"></div>';
+      var box = r.boxart ? '<img class="box" src="'+esc(r.boxart)+'" alt="" loading="lazy" data-v="boxart" onerror="coverFail(this)">' : '<div class="box"></div>';
       var low = v.atHistLow ? '<span class="badge low">📉 Historical Low</span>' : '';
       var cut = v.cheapest.cut ? '<span class="badge">−'+v.cheapest.cut+'%</span>' : '';
       var stm = v.cheapest.steam ? '<span class="badge steam">Steam</span>' : '';
+      var si = SHOTS.push({
+        title: r.title, price: v.cheapest.price, oldPrice: v.second.price,
+        cutPct: v.gapPct, shop: v.cheapest.shop,
+        badge: v.atHistLow ? 'HISTORICAL LOW' : '', cover: r.boxart,
+      }) - 1;
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title"><a href="'+esc(r.itadUrl)+'" target="_blank" rel="noopener">'+esc(r.title)+'</a></p>'+
@@ -872,6 +1128,7 @@ const HTML = `<!doctype html>
         '<div class="row"><span class="price-main">'+eur(v.cheapest.price)+'</span><span class="prices">bei <b>'+esc(v.cheapest.shop)+'</b></span></div>'+
         '<div class="prices">Zweitbilligster: '+eur(v.second.price)+' bei '+esc(v.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
         '<a class="buy" href="'+esc(v.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
+        '<button class="shotbtn" type="button" data-shot="'+si+'" title="Bild für TikTok/Story">📸</button>'+
         '<div class="ks" data-id="'+esc(r.id)+'"><button class="ksbtn" type="button">Keyshop-Preis (GG.deals)</button></div>'+
         '</div></div>'
       );
@@ -927,6 +1184,170 @@ const HTML = `<!doctype html>
       btn.disabled = false; btn.textContent = 'Keyshop-Preis (GG.deals)';
       box.insertAdjacentHTML('beforeend', '<span class="ksinfo err"> — Fehler</span>');
     }
+  });
+
+  // ---------- Post-Grafik (TikTok / Story / Feed) ----------
+  var BRAND = '${BRAND}';
+  var shotFmt = '916', shotCur = null;
+
+  function loadImage(src){
+    return new Promise(function(res){
+      var im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.onload = function(){ res(im); };
+      im.onerror = function(){ res(null); };
+      im.src = src;
+    });
+  }
+  function wrapLines(x, text, maxW){
+    var words = String(text).split(' '), lines = [], cur = '';
+    for (var i=0;i<words.length;i++){
+      var t = cur ? cur + ' ' + words[i] : words[i];
+      if (x.measureText(t).width > maxW && cur) { lines.push(cur); cur = words[i]; }
+      else cur = t;
+    }
+    if (cur) lines.push(cur);
+    return lines.slice(0, 3);
+  }
+  function roundRect(x, px, py, w, h, r){
+    x.beginPath();
+    x.moveTo(px+r, py); x.arcTo(px+w, py, px+w, py+h, r); x.arcTo(px+w, py+h, px, py+h, r);
+    x.arcTo(px, py+h, px, py, r); x.arcTo(px, py, px+w, py, r); x.closePath();
+  }
+
+  async function drawShot(d, fmt){
+    var c = $('shotCanvas');
+    var W = 1080, H = fmt === '11' ? 1080 : 1920;
+    c.width = W; c.height = H;
+    var x = c.getContext('2d');
+    // Nötig: Bei gleicher Größe leert das Setzen von width/height nicht zuverlässig,
+    // sonst überlagern sich zwei Deals.
+    x.clearRect(0, 0, W, H);
+    x.textBaseline = 'alphabetic';
+
+    var g = x.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, '#141a25'); g.addColorStop(1, '#090c12');
+    x.fillStyle = g; x.fillRect(0, 0, W, H);
+    var glow = x.createRadialGradient(W*0.5, H*0.3, 30, W*0.5, H*0.3, W*0.85);
+    glow.addColorStop(0, 'rgba(74,222,128,0.18)'); glow.addColorStop(1, 'rgba(0,0,0,0)');
+    x.fillStyle = glow; x.fillRect(0, 0, W, H);
+
+    var img = d.cover ? await loadImage('/img?u=' + encodeURIComponent(d.cover)) : null;
+    var wide = fmt === '11';
+    var cw = wide ? 340 : 520, ch = Math.round(cw * 1.5);
+    var cx = wide ? 80 : Math.round((W - cw) / 2);
+    var cy = wide ? Math.round((H - ch) / 2) : 210;
+
+    x.save();
+    x.shadowColor = 'rgba(0,0,0,0.55)'; x.shadowBlur = 40; x.shadowOffsetY = 14;
+    roundRect(x, cx, cy, cw, ch, 18); x.fillStyle = '#1e2330'; x.fill();
+    x.restore();
+    if (img) {
+      x.save(); roundRect(x, cx, cy, cw, ch, 18); x.clip(); x.drawImage(img, cx, cy, cw, ch); x.restore();
+    } else {
+      // Nicht jedes Spiel hat ein Cover – dann der Anfangsbuchstabe statt leerem Kasten
+      x.save();
+      roundRect(x, cx, cy, cw, ch, 18); x.strokeStyle = '#2a3040'; x.lineWidth = 3; x.stroke();
+      x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillStyle = '#39415a';
+      x.font = 'bold ' + Math.round(cw * 0.5) + 'px system-ui, Segoe UI, sans-serif';
+      x.fillText((d.title || '?').charAt(0).toUpperCase(), cx + cw / 2, cy + ch / 2);
+      x.restore();
+    }
+
+    // Kopfzeile
+    x.fillStyle = '#4ade80'; x.font = 'bold 34px system-ui, Segoe UI, sans-serif';
+    x.textAlign = wide ? 'left' : 'center';
+    x.fillText('🎯 KEY SNIPER', wide ? 460 : W/2, wide ? 190 : 120);
+
+    var tx = wide ? 460 : W/2, maxW = wide ? 550 : 900;
+    var ty = wide ? 250 : cy + ch + 110;
+    x.textAlign = wide ? 'left' : 'center';
+
+    // Titel
+    x.fillStyle = '#e7ebf2'; x.font = 'bold 58px system-ui, Segoe UI, sans-serif';
+    var lines = wrapLines(x, d.title, maxW);
+    for (var i=0;i<lines.length;i++){ x.fillText(lines[i], tx, ty + i*70); }
+    ty += lines.length * 70 + (wide ? 50 : 70);
+
+    // Preis
+    x.fillStyle = '#4ade80'; x.font = 'bold 132px system-ui, Segoe UI, sans-serif';
+    x.fillText(eur(d.price), tx, ty);
+    ty += wide ? 80 : 96;
+
+    // Vergleichspreis durchgestrichen
+    if (d.oldPrice != null && d.oldPrice > d.price) {
+      x.fillStyle = '#8b93a7'; x.font = '46px system-ui, Segoe UI, sans-serif';
+      var oldTxt = 'statt ' + eur(d.oldPrice);
+      x.fillText(oldTxt, tx, ty);
+      var m = x.measureText(oldTxt);
+      var lx = wide ? tx : tx - m.width/2;
+      x.strokeStyle = '#f87171'; x.lineWidth = 4;
+      x.beginPath(); x.moveTo(lx, ty - 14); x.lineTo(lx + m.width, ty - 14); x.stroke();
+      ty += wide ? 80 : 100;
+    }
+
+    // Rabatt-Badge
+    if (d.cutPct != null && d.cutPct > 0) {
+      x.font = 'bold 52px system-ui, Segoe UI, sans-serif';
+      var bt = '−' + d.cutPct + '%';
+      var bw = x.measureText(bt).width + 60, bh = 84;
+      var bx = wide ? tx : tx - bw/2;
+      roundRect(x, bx, ty - 60, bw, bh, 42); x.fillStyle = '#4ade80'; x.fill();
+      x.fillStyle = '#04120a'; x.textAlign = 'center';
+      x.fillText(bt, bx + bw/2, ty - 2);
+      x.textAlign = wide ? 'left' : 'center';
+      ty += wide ? 80 : 110;
+    }
+
+    // Sonder-Banner
+    if (d.badge) {
+      x.fillStyle = '#fbbf24'; x.font = 'bold 44px system-ui, Segoe UI, sans-serif';
+      x.fillText('📉 ' + d.badge, tx, ty);
+      ty += wide ? 70 : 90;
+    }
+
+    // Shop
+    if (d.shop) {
+      x.fillStyle = '#8b93a7'; x.font = '40px system-ui, Segoe UI, sans-serif';
+      x.fillText('bei ' + d.shop, tx, ty);
+    }
+
+    // Fußzeile
+    x.textAlign = 'center'; x.fillStyle = '#5b6474';
+    x.font = 'bold 36px system-ui, Segoe UI, sans-serif';
+    x.fillText(BRAND, W/2, H - 60);
+  }
+
+  async function openShot(idx){
+    shotCur = SHOTS[idx];
+    if (!shotCur) return;
+    $('shotModal').classList.add('open');
+    await drawShot(shotCur, shotFmt);
+  }
+  function setFmt(f){
+    shotFmt = f;
+    $('fmt916').classList.toggle('on', f === '916');
+    $('fmt11').classList.toggle('on', f === '11');
+    if (shotCur) drawShot(shotCur, shotFmt);
+  }
+  $('fmt916').addEventListener('click', function(){ setFmt('916'); });
+  $('fmt11').addEventListener('click', function(){ setFmt('11'); });
+  $('shotClose').addEventListener('click', function(){ $('shotModal').classList.remove('open'); });
+  $('shotModal').addEventListener('click', function(e){ if (e.target === this) this.classList.remove('open'); });
+  $('shotDl').addEventListener('click', function(){
+    $('shotCanvas').toBlob(function(blob){
+      var name = (shotCur && shotCur.title ? shotCur.title : 'deal')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'keysniper-' + name + '-' + shotFmt + '.png';
+      a.click();
+      setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
+    }, 'image/png');
+  });
+  $('grid').addEventListener('click', function(e){
+    var b = e.target && e.target.closest ? e.target.closest('.shotbtn') : null;
+    if (b) openShot(+b.getAttribute('data-shot'));
   });
 
   load(false);

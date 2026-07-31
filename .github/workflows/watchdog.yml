@@ -1,0 +1,24 @@
+name: Wächter
+
+on:
+  schedule:
+    - cron: "20 * * * *"   # stündlich, versetzt zum Genre-Job
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code holen
+        uses: actions/checkout@v4
+
+      - name: Node einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Läuft der Cron noch?
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: node watchdog.mjs
