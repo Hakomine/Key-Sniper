@@ -65,6 +65,26 @@ Hinweis: Der **allererste** Lauf meldet einmalig viele Deals (alles ist „neu")
 danach kommen nur noch echte Neuigkeiten. Ein bereits gemeldeter Deal wird erst
 wieder gemeldet, wenn der Preis nochmal ≥10 % fällt.
 
+## Wächter (merkt, wenn nichts mehr läuft)
+Ohne ihn ist Stille mehrdeutig: „keine Deals" oder „alles kaputt"?
+
+- Der Cron schreibt seinen Zustand mit, abrufbar unter **`/api/health`**.
+- Fehler meldet er per Discord (höchstens 1×/Stunde), dazu 1× täglich ein Lebenszeichen.
+- **Externer Check** (`watchdog.mjs`, stündlich über `.github/workflows/watchdog.yml`):
+  schlägt Alarm, wenn der Worker nicht antwortet oder der letzte Lauf > 30 Min her ist.
+  Dafür in GitHub zwei Secrets setzen: `WORKER_URL` (deine Worker-Adresse) und
+  `DISCORD_WEBHOOK` (dieselbe URL wie in Cloudflare).
+
+## Content: Grafiken & Stream-Overlay
+- **📸-Knopf** auf jeder Karte → fertige Post-Grafik als PNG, wahlweise **9:16**
+  (TikTok/Reels/Shorts) oder **1:1** (Feed). Wasserzeichen über die Konstante
+  `BRAND` oben in `worker.js` änderbar.
+- **`/overlay`** → Browser-Source für OBS: transparenter Hintergrund, Top-Deals,
+  aktualisiert sich alle 5 Min. Parameter: `?n=5&gap=7` (Anzahl, Mindest-Lücke).
+- **`/img?u=…`** ist der Bild-Proxy dahinter (feste Host-Liste). Er probiert
+  `boxart → banner600 → banner400`, weil ITAD bei fehlendem Bild HTTP 200 mit einer
+  XML-Fehlermeldung liefert statt 404. Hebt die Cover-Abdeckung von 75 % auf 93 %.
+
 Attribution: GG.deals verlangt einen Quellen-Link – der steht als Fußzeile in der App
 und jeder geladene Keyshop-Preis verlinkt auf die GG.deals-Spielseite.
 

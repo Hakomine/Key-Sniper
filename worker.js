@@ -811,7 +811,7 @@ const OVERLAY_HTML = `<!doctype html>
       for (var j=0;j<Math.min(N, items.length);j++){
         var r = items[j].r, v = items[j].v;
         out.push('<div class="row">' +
-          (r.boxart ? '<img class="cover" src="'+esc(r.boxart)+'" onerror="this.style.visibility=\\'hidden\\'">' : '<div class="cover"></div>') +
+          (r.boxart ? '<img class="cover" src="/img?u='+encodeURIComponent(r.boxart)+'" onerror="this.style.visibility=\\'hidden\\'">' : '<div class="cover"></div>') +
           '<div class="info"><div class="name">'+esc(r.title)+'</div>' +
           '<div class="sub">'+esc(v.cheapest.shop)+' · '+v.gapAbs+' € günstiger' +
           (v.atHistLow ? ' <span class="low">📉 TIEFSTPREIS</span>' : '') + '</div></div>' +
@@ -1207,7 +1207,9 @@ const HTML = `<!doctype html>
       else cur = t;
     }
     if (cur) lines.push(cur);
-    return lines.slice(0, 3);
+    var out = lines.slice(0, 3);
+    if (lines.length > 3) out[2] += '…';   // gekürzt statt hart abgeschnitten
+    return out;
   }
   function roundRect(x, px, py, w, h, r){
     x.beginPath();
@@ -1257,10 +1259,10 @@ const HTML = `<!doctype html>
     // Kopfzeile
     x.fillStyle = '#4ade80'; x.font = 'bold 34px system-ui, Segoe UI, sans-serif';
     x.textAlign = wide ? 'left' : 'center';
-    x.fillText('🎯 KEY SNIPER', wide ? 460 : W/2, wide ? 190 : 120);
+    x.fillText('🎯 KEY SNIPER', wide ? 460 : W/2, wide ? 268 : 120);
 
     var tx = wide ? 460 : W/2, maxW = wide ? 550 : 900;
-    var ty = wide ? 250 : cy + ch + 110;
+    var ty = wide ? 330 : cy + ch + 110;
     x.textAlign = wide ? 'left' : 'center';
 
     // Titel
