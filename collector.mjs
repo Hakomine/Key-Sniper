@@ -213,7 +213,7 @@ function loadDb() {
     return {};
   }
 }
-const dbComplete = (e) => e && !Array.isArray(e) && typeof e === 'object' && 't' in e;
+const dbComplete = (e) => e && !Array.isArray(e) && typeof e === 'object' && 't' in e && 'r' in e;
 
 async function enrichGenres(results) {
   const db = loadDb();
@@ -227,9 +227,16 @@ async function enrichGenres(results) {
         const id = need[i++];
         try {
           const info = await api('/games/info/v2', { query: { id } });
-          db[id] = { t: Array.isArray(info.tags) ? info.tags : [], a: info.appid || null };
+          // Steam-Wertung: "billig" allein sagt nichts über ein Spiel aus
+          const rev = (info.reviews || []).find((x) => x.source === 'Steam');
+          db[id] = {
+            t: Array.isArray(info.tags) ? info.tags : [],
+            a: info.appid || null,
+            r: rev && rev.score != null ? rev.score : null,
+            rc: rev && rev.count != null ? rev.count : null,
+          };
         } catch {
-          db[id] = { t: [], a: null };
+          db[id] = { t: [], a: null, r: null, rc: null };
         }
         done++;
         if (done % 100 === 0) console.log(`  ... ${done}/${need.length} geholt`);
@@ -241,11 +248,16 @@ async function enrichGenres(results) {
   }
   for (const r of results) {
     const e = db[r.id];
-    r.tags = Array.isArray(e) ? e : (e && e.t) || [];
-    r.appid = Array.isArray(e) ? null : (e && e.a) || null;
+    const obj = Array.isArray(e) ? null : e;
+    r.tags = Array.isArray(e) ? e : (obj && obj.t) || [];
+    r.appid = obj ? obj.a || null : null;
+    r.rating = obj && obj.r != null ? obj.r : null;
+    r.ratingCount = obj && obj.rc != null ? obj.rc : null;
   }
   const mitAppid = results.filter((r) => r.appid).length;
+  const mitRating = results.filter((r) => r.rating != null).length;
   console.log(`  Steam-IDs vorhanden: ${mitAppid}/${results.length}`);
+  console.log(`  Bewertungen vorhanden: ${mitRating}/${results.length}`);
 }
 
 async function main() {

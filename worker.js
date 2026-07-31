@@ -44,6 +44,12 @@ const ALARM_SCAN = 200;         // Spiele pro Alarm-Lauf (schlank wegen CPU-Limi
 const ALARM_TTL = 14 * 24 * 3600; // so lange gilt ein Deal als "schon gemeldet"
 const ALARM_REDROP_PCT = 10;    // erneut melden, wenn Preis nochmal 10% fällt
 const ALARM_MAX_EMBEDS = 10;    // Discord erlaubt max. 10 Embeds pro Nachricht
+// Billig heißt nicht gut: schwach bewertete Spiele lösen keinen Alarm aus.
+const ALARM_MIN_RATING = 75;    // % positiv auf Steam
+const ALARM_MIN_VOTES = 50;     // darunter ist die Quote wertlos ("100% bei 3 Reviews")
+// Bewertung fehlt (z.B. reine GOG/Epic-Titel) -> nicht aussortieren
+const ratingOk = (r, c) =>
+  r == null || (c != null && c < ALARM_MIN_VOTES) || r >= ALARM_MIN_RATING;
 
 // Wächter: merkt, wenn der Cron stirbt oder eine API ausfällt
 const HEALTH_TTL = 7 * 24 * 3600;
@@ -238,7 +244,12 @@ async function loadGameDb(env) {
     const raw = await res.json();
     for (const k in raw) {
       const e = raw[k];
-      map.set(k, Array.isArray(e) ? { tags: e, appid: null } : { tags: e.t || [], appid: e.a || null });
+      map.set(
+        k,
+        Array.isArray(e)
+          ? { tags: e, appid: null, rating: null, ratingCount: null }
+          : { tags: e.t || [], appid: e.a || null, rating: e.r ?? null, ratingCount: e.rc ?? null }
+      );
     }
   } catch {}
   return map;
@@ -347,9 +358,9 @@ async function buildDeals(env) {
   const LIMIT = 200;
 
   // Spiele-DB (optional): Genres für den Filter, Steam-IDs für die Keyshop-Preise
-  const genreMap = new Map();
+  const genreMap = new Map();   // wird unten für Tags und Bewertung genutzt
   const db = await loadGameDb(env);
-  for (const [id, e] of db) genreMap.set(id, e.tags);
+  for (const [id, e] of db) genreMap.set(id, e);
 
   // 1) Deals (tiefste Rabatte) UND beliebteste Spiele parallel holen
   const dealsPromise = (async () => {
@@ -424,7 +435,9 @@ async function buildDeals(env) {
       boxart: 'https://assets.isthereanydeal.com/' + id + '/boxart.jpg',
       histLow,
       pop: popMap.get(id) || 0,
-      tags: genreMap.get(id) || [],
+      tags: (genreMap.get(id) || {}).tags || [],
+      rating: (genreMap.get(id) || {}).rating ?? null,
+      ratingCount: (genreMap.get(id) || {}).ratingCount ?? null,
       itadUrl: 'https://isthereanydeal.com/game/' + c.slug + '/info/',
       all,
       rep,
@@ -624,7 +637,10 @@ async function alarmDeals(env) {
   const key = env.ITAD_API_KEY;
   if (!key) return [];
 
-  const popular = await itad('/stats/most-popular/v1', { query: { limit: ALARM_SCAN }, key });
+  const [popular, db] = await Promise.all([
+    itad('/stats/most-popular/v1', { query: { limit: ALARM_SCAN }, key }),
+    loadGameDb(env), // liefert die Steam-Bewertung je Spiel
+  ]);
   const list = Array.isArray(popular) ? popular : [];
   if (!list.length) return [];
 
@@ -646,6 +662,10 @@ async function alarmDeals(env) {
     if (!v) continue;
     // "Krass genug": große Lücke, oder Historical Low mit spürbarer Lücke
     if (!(v.gapAbs >= ALARM_MIN_GAP || (v.atHistLow && v.gapAbs >= ALARM_HISTLOW_GAP))) continue;
+    const gi = db.get(g.id);
+    const rating = gi ? gi.rating : null;
+    const ratingCount = gi ? gi.ratingCount : null;
+    if (!ratingOk(rating, ratingCount)) continue;
     hits.push({
       key: 'deal:' + g.id,
       kind: 'deal',
@@ -656,6 +676,8 @@ async function alarmDeals(env) {
       gapPct: v.gapPct,
       atHistLow: v.atHistLow,
       steam: v.cheapest.steam,
+      rating,
+      ratingCount,
       boxart: 'https://assets.isthereanydeal.com/' + g.id + '/boxart.jpg',
       link: rawShopUrl(v.cheapest.url),
     });
@@ -690,7 +712,12 @@ async function radarUniverse(env) {
     const res = await fetch('https://steamspy.com/api.php?request=all&page=' + page);
     if (!res.ok) break;
     const data = await res.json();
-    for (const g of Object.values(data)) if (g && +g.price > 0) ids.push(g.appid);
+    for (const g of Object.values(data)) {
+      if (!g || !(+g.price > 0)) continue;
+      // Bewertung gleich mitnehmen – SteamSpy liefert sie ohne Zusatzkosten
+      const votes = (g.positive || 0) + (g.negative || 0);
+      ids.push({ a: g.appid, r: votes ? Math.round((g.positive / votes) * 100) : null, rc: votes || null });
+    }
     if (ids.length >= RADAR_TOTAL) break;
   }
   const pool = ids.slice(0, RADAR_TOTAL);
@@ -712,7 +739,13 @@ async function rotateRadar(env) {
   const block = pool.slice(cur * RADAR_BLOCK, (cur + 1) * RADAR_BLOCK);
   if (!block.length) return [];
 
-  const deals = await scanKeyshops(ggKey, block);
+  const ratingBy = new Map(block.map((b) => [b.a, b]));
+  const deals = await scanKeyshops(ggKey, block.map((b) => b.a));
+  for (const d of deals) {
+    const b = ratingBy.get(d.appid);
+    d.rating = b ? b.r : null;
+    d.ratingCount = b ? b.rc : null;
+  }
   // Für die Radar-Ansicht: nah am Keyshop-Tief oder deutlich unter dem offiziellen Preis
   const keep = deals.filter(
     (d) => d.overLowPct <= RADAR_MAX_OVER_LOW || (d.savingPct != null && d.savingPct >= RADAR_MIN_CUT)
@@ -729,7 +762,7 @@ async function rotateRadar(env) {
   // Gemessen ergibt das ~12 Meldungen pro Durchlauf. Ein reines Rabatt-Kriterium
   // wäre wertlos – 90 % unter UVP ist bei Keyshops Alltag.
   const hits = keep
-    .filter((d) => d.overLowPct <= 0)
+    .filter((d) => d.overLowPct <= 0 && ratingOk(d.rating, d.ratingCount))
     .map((d) => ({
       key: 'ks:' + d.appid,
       kind: 'keyshop',
@@ -740,6 +773,8 @@ async function rotateRadar(env) {
       cutPct: d.savingPct,
       atKsLow: d.overLowPct <= 0,
       savingPct: d.savingPct,
+      rating: d.rating,
+      ratingCount: d.ratingCount,
       boxart: 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + d.appid + '/library_600x900.jpg',
       link: d.url,
     }));
@@ -761,6 +796,11 @@ async function onlyNew(env, hits) {
 }
 
 const eurTxt = (n) => (n == null ? '–' : (+n).toFixed(2).replace('.', ',') + ' €');
+const votesTxt = (n) =>
+  n == null ? '' : n >= 1000000 ? (n / 1000000).toFixed(1).replace('.', ',') + ' Mio.'
+  : n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
+const ratingTxt = (h) =>
+  h.rating == null ? '' : '\n👍 ' + h.rating + '% positiv' + (h.ratingCount ? ' (' + votesTxt(h.ratingCount) + ')' : '');
 const rawShopUrl = (goUrl) => {
   const i = (goUrl || '').indexOf('u=');
   return i === -1 ? goUrl : decodeURIComponent(goUrl.slice(i + 2));
@@ -782,7 +822,8 @@ async function sendDiscord(env, hits) {
             (h.savingPct != null && h.savingPct > 0
               ? ' · **−' + h.savingPct + '%** gegenüber ' + eurTxt(h.retail)
               : '') +
-            (h.atKsLow ? '\n📉 **So billig war es dort noch nie**' : ''),
+            (h.atKsLow ? '\n📉 **So billig war es dort noch nie**' : '') +
+            ratingTxt(h),
           color: 3718648,
           thumbnail: h.boxart ? { url: h.boxart } : undefined,
           footer: { text: 'Keyshop-Radar (Grau-Markt) · GG.deals' },
@@ -794,6 +835,7 @@ async function sendDiscord(env, hits) {
             '**' + eurTxt(h.price) + '** bei **' + h.shop + '**\n' +
             h.gapAbs + ' € / ' + h.gapPct + '% Lücke zum zweitbilligsten Shop' +
             (h.atHistLow ? '\n📉 **Historical Low**' : '') +
+            ratingTxt(h) +
             (h.steam ? '\nSteam-Key' : ''),
           color: h.atHistLow ? 16498468 : 4906624,
           thumbnail: h.boxart ? { url: h.boxart } : undefined,
@@ -943,6 +985,8 @@ const HTML = `<!doctype html>
   .badge.low { color:var(--gold); border-color:var(--gold); }
   .badge.gap { color:var(--accent); border-color:var(--accent); font-weight:600; }
   .badge.steam { color:var(--accent2); border-color:var(--accent2); }
+  .badge.good { color:var(--accent); border-color:var(--accent); }
+  .badge.weak { color:var(--danger); border-color:var(--danger); }
   .prices { font-size:13px; color:var(--muted); }
   .prices b { color:var(--text); }
   .price-main { font-size:20px; font-weight:700; color:var(--accent); }
@@ -973,10 +1017,12 @@ const HTML = `<!doctype html>
       <div class="ctrl"><label>Mindest-Lücke: <span class="val" id="gapAbsVal">5 €</span></label><input type="range" id="gapAbs" min="0" max="30" step="0.5" value="5" /></div>
       <div class="ctrl"><label>Mindest-Lücke: <span class="val" id="gapPctVal">0 %</span></label><input type="range" id="gapPct" min="0" max="90" step="5" value="0" /></div>
       <div class="ctrl"><label>Max. Preis: <span class="val" id="maxPriceVal">egal</span></label><input type="range" id="maxPrice" min="0" max="70" step="1" value="0" /></div>
+      <div class="ctrl"><label>Mindest-Bewertung: <span class="val" id="minRatingVal">egal</span></label><input type="range" id="minRating" min="0" max="95" step="5" value="0" /></div>
       <div class="ctrl"><label>Sortierung</label><select id="sort">
         <option value="gapAbs">Größte Lücke (€)</option>
         <option value="gapPct">Größte Lücke (%)</option>
         <option value="pop">Beliebtheit</option>
+        <option value="rating">Beste Bewertung</option>
         <option value="price">Billigster Preis</option>
         <option value="title">Name (A–Z)</option>
       </select></div>
@@ -1018,6 +1064,12 @@ const HTML = `<!doctype html>
   var DATA = { deals: [], generatedAt: null, count: 0, country: 'DE' };
   function $(id){ return document.getElementById(id); }
   function eur(n){ return n==null ? '–' : n.toLocaleString('de-DE',{style:'currency',currency:'EUR'}); }
+  function votes(n){ return n==null?'':(n>=1000000?(n/1000000).toFixed(1).replace('.',',')+' Mio.':(n>=1000?Math.round(n/1000)+'k':String(n))); }
+  function ratingBadge(r, c){
+    if (r == null) return '';
+    var cls = r >= 80 ? 'badge good' : (r >= 60 ? 'badge' : 'badge weak');
+    return '<span class="'+cls+'">👍 '+r+'%'+(c?' ('+votes(c)+')':'')+'</span>';
+  }
   function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 
   // Viele Spiele haben kein "boxart", aber ein Banner – der Reihe nach durchprobieren
@@ -1032,7 +1084,7 @@ const HTML = `<!doctype html>
     } else { el.style.visibility = 'hidden'; }
   }
 
-  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), genre:$('genre'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
+  var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), minRating:$('minRating'), sort:$('sort'), genre:$('genre'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
   var RADAR = { deals: [], generatedAt: null, loaded: false, loading: false };
   var GENRE_KW = { shooter:['shooter','fps'], 'co-op':['co-op','coop','multiplayer'] };
   function matchGenre(tags, cat){
@@ -1088,7 +1140,7 @@ const HTML = `<!doctype html>
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title">'+esc(r.title)+'</p>'+
-        '<div class="badges">'+over+sav+'</div>'+
+        '<div class="badges">'+over+ratingBadge(r.rating,r.ratingCount)+sav+'</div>'+
         '<div class="row"><span class="price-main">'+eur(r.keyshop)+'</span><span class="prices">Keyshop (Grau-Markt)</span></div>'+
         '<div class="prices">Keyshop-Allzeittief: '+eur(r.ksLow)+(r.retail!=null?' · offiziell: '+eur(r.retail):'')+'</div>'+
         (r.url ? '<a class="buy" href="'+esc(r.url)+'" target="_blank" rel="noopener">auf GG.deals →</a>' : '')+
@@ -1103,6 +1155,7 @@ const HTML = `<!doctype html>
     var gapAbs = parseFloat(ui.gapAbs.value);
     var gapPct = parseInt(ui.gapPct.value, 10);
     var maxPrice = parseInt(ui.maxPrice.value, 10);
+    var minRating = parseInt(ui.minRating.value, 10);
     var q = ui.q.value.trim().toLowerCase();
     var genre = ui.genre.value;
     var onlyRep = ui.onlyRep.checked;
@@ -1111,6 +1164,7 @@ const HTML = `<!doctype html>
     $('gapAbsVal').textContent = gapAbs + ' €';
     $('gapPctVal').textContent = gapPct + ' %';
     $('maxPriceVal').textContent = maxPrice === 0 ? 'egal' : maxPrice + ' €';
+    $('minRatingVal').textContent = minRating === 0 ? 'egal' : 'ab ' + minRating + '%';
 
     // aktive Sicht je nach Häkchen: nur seriöse Stores oder alle
     var items = [];
@@ -1126,6 +1180,7 @@ const HTML = `<!doctype html>
       if (maxPrice > 0 && x.v.cheapest.price > maxPrice) return false;
       if (onlyLow && !x.v.atHistLow) return false;
       if (onlySteam && !x.v.cheapest.steam) return false;
+      if (minRating > 0 && x.r.rating != null && x.r.rating < minRating) return false;
       if (genre && !matchGenre(x.r.tags, genre)) return false;
       if (q && x.r.title.toLowerCase().indexOf(q) === -1) return false;
       return true;
@@ -1135,6 +1190,7 @@ const HTML = `<!doctype html>
       if (s==='gapAbs') return b.v.gapAbs - a.v.gapAbs;
       if (s==='gapPct') return b.v.gapPct - a.v.gapPct;
       if (s==='pop') return (b.r.pop||0) - (a.r.pop||0) || (b.v.gapAbs - a.v.gapAbs);
+      if (s==='rating') return (b.r.rating||0) - (a.r.rating||0) || (b.r.ratingCount||0) - (a.r.ratingCount||0);
       if (s==='price') return a.v.cheapest.price - b.v.cheapest.price;
       if (s==='title') return a.r.title.localeCompare(b.r.title);
       return 0;
@@ -1151,7 +1207,7 @@ const HTML = `<!doctype html>
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title"><a href="'+esc(r.itadUrl)+'" target="_blank" rel="noopener">'+esc(r.title)+'</a></p>'+
-        '<div class="badges"><span class="badge gap">'+v.gapAbs+' € / '+v.gapPct+'% Lücke</span>'+low+stm+cut+'</div>'+
+        '<div class="badges"><span class="badge gap">'+v.gapAbs+' € / '+v.gapPct+'% Lücke</span>'+ratingBadge(r.rating,r.ratingCount)+low+stm+cut+'</div>'+
         '<div class="row"><span class="price-main">'+eur(v.cheapest.price)+'</span><span class="prices">bei <b>'+esc(v.cheapest.shop)+'</b></span></div>'+
         '<div class="prices">Zweitbilligster: '+eur(v.second.price)+' bei '+esc(v.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
         '<a class="buy" href="'+esc(v.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
@@ -1179,7 +1235,7 @@ const HTML = `<!doctype html>
     setMeta(); render();
   }
 
-  var keys = ['gapAbs','gapPct','maxPrice','sort','genre','q','onlyRep','onlyLow','onlySteam'];
+  var keys = ['gapAbs','gapPct','maxPrice','minRating','sort','genre','q','onlyRep','onlyLow','onlySteam'];
   for (var k=0;k<keys.length;k++){ ui[keys[k]].addEventListener('input', render); ui[keys[k]].addEventListener('change', render); }
   $('refresh').addEventListener('click', function(){ if ($('radar').checked) loadRadar(true); else load(true); });
 

@@ -75,6 +75,17 @@ Ohne ihn ist Stille mehrdeutig: „keine Deals" oder „alles kaputt"?
   Dafür in GitHub zwei Secrets setzen: `WORKER_URL` (deine Worker-Adresse) und
   `DISCORD_WEBHOOK` (dieselbe URL wie in Cloudflare).
 
+## Bewertungen
+Billig heißt nicht gut. Jede Karte zeigt die Steam-Wertung (👍 % positiv und Anzahl),
+dazu gibt es den Regler **Mindest-Bewertung** und die Sortierung **Beste Bewertung**.
+
+- Quelle Hauptliste: ITAD `/games/info/v2` → in `genres-db.json` mitgespeichert
+  (Feld `r` = Score, `rc` = Anzahl). Der Genre-Job pflegt das automatisch.
+- Quelle Radar: SteamSpy (`positive`/`negative`), kommt beim Universum-Laden mit.
+- **Alarm**: meldet nur Spiele ab `ALARM_MIN_RATING` (75 %) mit mindestens
+  `ALARM_MIN_VOTES` (50) Bewertungen. Spiele ganz ohne Wertung (reine GOG/Epic-Titel)
+  werden weiterhin gemeldet, sonst gingen sie verloren.
+
 ## Stream-Overlay
 - **`/overlay`** → Browser-Source für OBS: transparenter Hintergrund, Top-Deals,
   aktualisiert sich alle 5 Min. Parameter: `?n=5&gap=7` (Anzahl, Mindest-Lücke).

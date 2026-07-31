@@ -55,6 +55,8 @@
   .badge.low { color: var(--gold); border-color: var(--gold); }
   .badge.gap { color: var(--accent); border-color: var(--accent); font-weight: 600; }
   .badge.steam { color: var(--accent2); border-color: var(--accent2); }
+  .badge.good { color: var(--accent); border-color: var(--accent); }
+  .badge.weak { color: var(--danger); border-color: var(--danger); }
   .prices { font-size: 13px; color: var(--muted); }
   .prices b { color: var(--text); }
   .price-main { font-size: 20px; font-weight: 700; color: var(--accent); }
@@ -95,9 +97,14 @@
           <option value="gapAbs">Größte Lücke (€)</option>
           <option value="gapPct">Größte Lücke (%)</option>
           <option value="pop">Beliebtheit</option>
+          <option value="rating">Beste Bewertung</option>
           <option value="price">Billigster Preis</option>
           <option value="title">Name (A–Z)</option>
         </select>
+      </div>
+      <div class="ctrl">
+        <label>Mindest-Bewertung: <span class="val" id="minRatingVal">egal</span></label>
+        <input type="range" id="minRating" min="0" max="95" step="5" value="0" />
       </div>
       <div class="ctrl">
         <label>Genre</label>
@@ -152,7 +159,7 @@
 
   const ui = {
     gapAbs: $("gapAbs"), gapPct: $("gapPct"), maxPrice: $("maxPrice"),
-    sort: $("sort"), genre: $("genre"), q: $("q"), onlyRep: $("onlyRep"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
+    sort: $("sort"), minRating: $("minRating"), genre: $("genre"), q: $("q"), onlyRep: $("onlyRep"), onlyLow: $("onlyLow"), onlySteam: $("onlySteam"),
   };
 
   // Genre-Kategorie -> passende Tag-Stichwörter (Tags kleingeschrieben durchsucht)
@@ -174,6 +181,7 @@
     const maxPrice = parseInt(ui.maxPrice.value, 10);
     const q = ui.q.value.trim().toLowerCase();
     const genre = ui.genre.value;
+    const minRating = parseInt(ui.minRating.value, 10);
     const onlyRep = ui.onlyRep.checked;
     const onlyLow = ui.onlyLow.checked;
     const onlySteam = ui.onlySteam.checked;
@@ -181,6 +189,7 @@
     $("gapAbsVal").textContent = gapAbs + " €";
     $("gapPctVal").textContent = gapPct + " %";
     $("maxPriceVal").textContent = maxPrice === 0 ? "egal" : maxPrice + " €";
+    $("minRatingVal").textContent = minRating === 0 ? "egal" : "ab " + minRating + "%";
 
     const grid = $("grid");
     if (!D.deals || D.deals.length === 0) {
@@ -209,6 +218,7 @@
       if (maxPrice > 0 && v.cheapest.price > maxPrice) return false;
       if (onlyLow && !v.atHistLow) return false;
       if (onlySteam && !v.cheapest.steam) return false;
+      if (minRating > 0 && r.rating != null && r.rating < minRating) return false;
       if (genre && !matchGenre(r.tags, genre)) return false;
       if (q && !r.title.toLowerCase().includes(q)) return false;
       return true;
@@ -219,6 +229,7 @@
       if (s === "gapAbs") return b.v.gapAbs - a.v.gapAbs;
       if (s === "gapPct") return b.v.gapPct - a.v.gapPct;
       if (s === "pop") return (b.r.pop || 0) - (a.r.pop || 0) || (b.v.gapAbs - a.v.gapAbs);
+      if (s === "rating") return (b.r.rating || 0) - (a.r.rating || 0) || (b.r.ratingCount || 0) - (a.r.ratingCount || 0);
       if (s === "price") return a.v.cheapest.price - b.v.cheapest.price;
       if (s === "title") return a.r.title.localeCompare(b.r.title);
       return 0;
@@ -229,6 +240,8 @@
       const box = r.boxart
         ? `<img class="box" src="${r.boxart}" alt="" loading="lazy" onerror="this.style.display='none'">`
         : `<div class="box"></div>`;
+      const ratingBadge = r.rating == null ? "" :
+        `<span class="badge ${r.rating >= 80 ? "good" : (r.rating >= 60 ? "" : "weak")}">👍 ${r.rating}%</span>`;
       const lowBadge = v.atHistLow ? `<span class="badge low">📉 Historical Low</span>` : "";
       const steamBadge = v.cheapest.steam ? `<span class="badge steam">Steam</span>` : "";
       const cutBadge = v.cheapest.cut ? `<span class="badge">−${v.cheapest.cut}%</span>` : "";
@@ -238,7 +251,7 @@
           <p class="title"><a href="${r.itadUrl}" target="_blank" rel="noopener">${r.title}</a></p>
           <div class="badges">
             <span class="badge gap">${v.gapAbs} € / ${v.gapPct}% Lücke</span>
-            ${lowBadge}${steamBadge}${cutBadge}
+            ${ratingBadge}${lowBadge}${steamBadge}${cutBadge}
           </div>
           <div class="row">
             <span class="price-main">${eur(v.cheapest.price)}</span>
