@@ -75,10 +75,7 @@ Ohne ihn ist Stille mehrdeutig: „keine Deals" oder „alles kaputt"?
   Dafür in GitHub zwei Secrets setzen: `WORKER_URL` (deine Worker-Adresse) und
   `DISCORD_WEBHOOK` (dieselbe URL wie in Cloudflare).
 
-## Content: Grafiken & Stream-Overlay
-- **📸-Knopf** auf jeder Karte → fertige Post-Grafik als PNG, wahlweise **9:16**
-  (TikTok/Reels/Shorts) oder **1:1** (Feed). Wasserzeichen über die Konstante
-  `BRAND` oben in `worker.js` änderbar.
+## Stream-Overlay
 - **`/overlay`** → Browser-Source für OBS: transparenter Hintergrund, Top-Deals,
   aktualisiert sich alle 5 Min. Parameter: `?n=5&gap=7` (Anzahl, Mindest-Lücke).
 - **`/img?u=…`** ist der Bild-Proxy dahinter (feste Host-Liste). Er probiert

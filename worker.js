@@ -50,8 +50,7 @@ const HEALTH_TTL = 7 * 24 * 3600;
 const ERROR_COOLDOWN = 3600;    // Fehler höchstens 1x pro Stunde melden
 const REPORT_HOUR_UTC = 7;      // Tagesbericht ab dieser UTC-Stunde (~9 Uhr DE)
 
-// Content-Grafiken
-const BRAND = 'Hakomine';       // Wasserzeichen auf den Post-Grafiken
+// Bild-Proxy (versorgt das Stream-Overlay mit Covern)
 const IMG_HOSTS = ['assets.isthereanydeal.com', 'cdn.cloudflare.steamstatic.com'];
 // Reihenfolge der Cover-Varianten: viele Spiele haben kein boxart, aber ein banner
 const COVER_VARIANTS = ['boxart', 'banner600', 'banner400'];
@@ -896,16 +895,6 @@ const HTML = `<!doctype html>
   .empty { text-align:center; padding:60px 20px; color:var(--muted); }
   .credit { max-width:1100px; margin:0 auto; padding:0 24px 40px; color:var(--muted); font-size:12px; }
   .credit a { color:var(--accent2); }
-  .shotbtn { margin-top:9px; margin-left:8px; padding:7px 11px; border:1px solid var(--border); border-radius:9px; background:var(--panel2); color:var(--muted); font-size:13px; cursor:pointer; }
-  .shotbtn:hover { border-color:var(--accent); color:var(--accent); }
-  .modal { position:fixed; inset:0; background:rgba(0,0,0,.75); display:none; align-items:center; justify-content:center; z-index:50; padding:20px; }
-  .modal.open { display:flex; }
-  .modalbox { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:18px; max-width:min(94vw,460px); max-height:92vh; overflow:auto; text-align:center; }
-  .modalbox canvas { width:100%; max-width:340px; height:auto; border-radius:10px; background:#0f1115; }
-  .modalrow { display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-top:12px; }
-  .modalrow button { padding:9px 14px; border-radius:9px; border:1px solid var(--border); background:var(--panel2); color:var(--text); font-size:14px; cursor:pointer; }
-  .modalrow button.prim { background:var(--accent); color:#04120a; border-color:var(--accent); font-weight:650; }
-  .modalrow button.on { border-color:var(--accent); color:var(--accent); }
 </style>
 </head>
 <body>
@@ -961,19 +950,6 @@ const HTML = `<!doctype html>
     · Keyshop-Preise: <a href="https://gg.deals" target="_blank" rel="noopener">GG.deals</a>
   </footer>
 
-  <div class="modal" id="shotModal">
-    <div class="modalbox">
-      <canvas id="shotCanvas" width="1080" height="1920"></canvas>
-      <div class="modalrow">
-        <button type="button" id="fmt916" class="on">9:16 TikTok</button>
-        <button type="button" id="fmt11">1:1 Post</button>
-      </div>
-      <div class="modalrow">
-        <button type="button" id="shotDl" class="prim">Bild speichern</button>
-        <button type="button" id="shotClose">Schließen</button>
-      </div>
-    </div>
-  </div>
 <script>
   var DATA = { deals: [], generatedAt: null, count: 0, country: 'DE' };
   function $(id){ return document.getElementById(id); }
@@ -994,7 +970,6 @@ const HTML = `<!doctype html>
 
   var ui = { gapAbs:$('gapAbs'), gapPct:$('gapPct'), maxPrice:$('maxPrice'), sort:$('sort'), genre:$('genre'), q:$('q'), onlyRep:$('onlyRep'), onlyLow:$('onlyLow'), onlySteam:$('onlySteam') };
   var RADAR = { deals: [], generatedAt: null, loaded: false, loading: false };
-  var SHOTS = [];   // Daten für die Post-Grafiken, wird beim Rendern gefüllt
   var GENRE_KW = { shooter:['shooter','fps'], 'co-op':['co-op','coop','multiplayer'] };
   function matchGenre(tags, cat){
     if (!cat) return true;
@@ -1037,7 +1012,6 @@ const HTML = `<!doctype html>
     }
     $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den beliebtesten Spielen – nach Abstand zum Keyshop-Allzeittief sortiert';
     var out = [];
-    SHOTS = [];
     for (var i=0;i<RADAR.deals.length;i++){
       var r = RADAR.deals[i];
       var over = (r.overLowPct != null && r.overLowPct <= 0)
@@ -1046,11 +1020,6 @@ const HTML = `<!doctype html>
       var sav = (r.savingPct != null && r.savingPct > 0) ? '<span class="badge">−'+r.savingPct+'% ggü. offiziell</span>' : '';
       var cov = 'https://cdn.cloudflare.steamstatic.com/steam/apps/'+r.appid+'/library_600x900.jpg';
       var box = '<img class="box" src="'+cov+'" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">';
-      var si = SHOTS.push({
-        title: r.title, price: r.keyshop, oldPrice: r.retail,
-        cutPct: r.savingPct, shop: 'Keyshop',
-        badge: (r.overLowPct != null && r.overLowPct <= 0) ? 'KEYSHOP-ALLZEITTIEF' : '', cover: cov,
-      }) - 1;
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title">'+esc(r.title)+'</p>'+
@@ -1058,7 +1027,6 @@ const HTML = `<!doctype html>
         '<div class="row"><span class="price-main">'+eur(r.keyshop)+'</span><span class="prices">Keyshop (Grau-Markt)</span></div>'+
         '<div class="prices">Keyshop-Allzeittief: '+eur(r.ksLow)+(r.retail!=null?' · offiziell: '+eur(r.retail):'')+'</div>'+
         (r.url ? '<a class="buy" href="'+esc(r.url)+'" target="_blank" rel="noopener">auf GG.deals →</a>' : '')+
-        '<button class="shotbtn" type="button" data-shot="'+si+'" title="Bild für TikTok/Story">📸</button>'+
         '</div></div>'
       );
     }
@@ -1109,18 +1077,12 @@ const HTML = `<!doctype html>
 
     $('summary').textContent = items.length + ' von ' + deals.length + ' Deals passen zu deinen Filtern' + (onlyRep ? ' (nur seriöse Stores)' : '');
     var out = [];
-    SHOTS = [];
     for (var i=0;i<items.length;i++){
       var r = items[i].r, v = items[i].v;
       var box = r.boxart ? '<img class="box" src="'+esc(r.boxart)+'" alt="" loading="lazy" data-v="boxart" onerror="coverFail(this)">' : '<div class="box"></div>';
       var low = v.atHistLow ? '<span class="badge low">📉 Historical Low</span>' : '';
       var cut = v.cheapest.cut ? '<span class="badge">−'+v.cheapest.cut+'%</span>' : '';
       var stm = v.cheapest.steam ? '<span class="badge steam">Steam</span>' : '';
-      var si = SHOTS.push({
-        title: r.title, price: v.cheapest.price, oldPrice: v.second.price,
-        cutPct: v.gapPct, shop: v.cheapest.shop,
-        badge: v.atHistLow ? 'HISTORICAL LOW' : '', cover: r.boxart,
-      }) - 1;
       out.push(
         '<div class="card">'+box+'<div class="body">'+
         '<p class="title"><a href="'+esc(r.itadUrl)+'" target="_blank" rel="noopener">'+esc(r.title)+'</a></p>'+
@@ -1128,7 +1090,6 @@ const HTML = `<!doctype html>
         '<div class="row"><span class="price-main">'+eur(v.cheapest.price)+'</span><span class="prices">bei <b>'+esc(v.cheapest.shop)+'</b></span></div>'+
         '<div class="prices">Zweitbilligster: '+eur(v.second.price)+' bei '+esc(v.second.shop)+(r.histLow!=null?' · ATL '+eur(r.histLow):'')+'</div>'+
         '<a class="buy" href="'+esc(v.cheapest.url)+'" target="_blank" rel="noopener">Zum Shop →</a>'+
-        '<button class="shotbtn" type="button" data-shot="'+si+'" title="Bild für TikTok/Story">📸</button>'+
         '<div class="ks" data-id="'+esc(r.id)+'"><button class="ksbtn" type="button">Keyshop-Preis (GG.deals)</button></div>'+
         '</div></div>'
       );
@@ -1184,172 +1145,6 @@ const HTML = `<!doctype html>
       btn.disabled = false; btn.textContent = 'Keyshop-Preis (GG.deals)';
       box.insertAdjacentHTML('beforeend', '<span class="ksinfo err"> — Fehler</span>');
     }
-  });
-
-  // ---------- Post-Grafik (TikTok / Story / Feed) ----------
-  var BRAND = '${BRAND}';
-  var shotFmt = '916', shotCur = null;
-
-  function loadImage(src){
-    return new Promise(function(res){
-      var im = new Image();
-      im.crossOrigin = 'anonymous';
-      im.onload = function(){ res(im); };
-      im.onerror = function(){ res(null); };
-      im.src = src;
-    });
-  }
-  function wrapLines(x, text, maxW){
-    var words = String(text).split(' '), lines = [], cur = '';
-    for (var i=0;i<words.length;i++){
-      var t = cur ? cur + ' ' + words[i] : words[i];
-      if (x.measureText(t).width > maxW && cur) { lines.push(cur); cur = words[i]; }
-      else cur = t;
-    }
-    if (cur) lines.push(cur);
-    var out = lines.slice(0, 3);
-    if (lines.length > 3) out[2] += '…';   // gekürzt statt hart abgeschnitten
-    return out;
-  }
-  function roundRect(x, px, py, w, h, r){
-    x.beginPath();
-    x.moveTo(px+r, py); x.arcTo(px+w, py, px+w, py+h, r); x.arcTo(px+w, py+h, px, py+h, r);
-    x.arcTo(px, py+h, px, py, r); x.arcTo(px, py, px+w, py, r); x.closePath();
-  }
-
-  async function drawShot(d, fmt){
-    var c = $('shotCanvas');
-    var W = 1080, H = fmt === '11' ? 1080 : 1920;
-    c.width = W; c.height = H;
-    var x = c.getContext('2d');
-    // Nötig: Bei gleicher Größe leert das Setzen von width/height nicht zuverlässig,
-    // sonst überlagern sich zwei Deals.
-    x.clearRect(0, 0, W, H);
-    x.textBaseline = 'alphabetic';
-
-    var g = x.createLinearGradient(0, 0, W, H);
-    g.addColorStop(0, '#141a25'); g.addColorStop(1, '#090c12');
-    x.fillStyle = g; x.fillRect(0, 0, W, H);
-    var glow = x.createRadialGradient(W*0.5, H*0.3, 30, W*0.5, H*0.3, W*0.85);
-    glow.addColorStop(0, 'rgba(74,222,128,0.18)'); glow.addColorStop(1, 'rgba(0,0,0,0)');
-    x.fillStyle = glow; x.fillRect(0, 0, W, H);
-
-    var img = d.cover ? await loadImage('/img?u=' + encodeURIComponent(d.cover)) : null;
-    var wide = fmt === '11';
-    var cw = wide ? 340 : 520, ch = Math.round(cw * 1.5);
-    var cx = wide ? 80 : Math.round((W - cw) / 2);
-    var cy = wide ? Math.round((H - ch) / 2) : 210;
-
-    x.save();
-    x.shadowColor = 'rgba(0,0,0,0.55)'; x.shadowBlur = 40; x.shadowOffsetY = 14;
-    roundRect(x, cx, cy, cw, ch, 18); x.fillStyle = '#1e2330'; x.fill();
-    x.restore();
-    if (img) {
-      x.save(); roundRect(x, cx, cy, cw, ch, 18); x.clip(); x.drawImage(img, cx, cy, cw, ch); x.restore();
-    } else {
-      // Nicht jedes Spiel hat ein Cover – dann der Anfangsbuchstabe statt leerem Kasten
-      x.save();
-      roundRect(x, cx, cy, cw, ch, 18); x.strokeStyle = '#2a3040'; x.lineWidth = 3; x.stroke();
-      x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillStyle = '#39415a';
-      x.font = 'bold ' + Math.round(cw * 0.5) + 'px system-ui, Segoe UI, sans-serif';
-      x.fillText((d.title || '?').charAt(0).toUpperCase(), cx + cw / 2, cy + ch / 2);
-      x.restore();
-    }
-
-    // Kopfzeile
-    x.fillStyle = '#4ade80'; x.font = 'bold 34px system-ui, Segoe UI, sans-serif';
-    x.textAlign = wide ? 'left' : 'center';
-    x.fillText('🎯 KEY SNIPER', wide ? 460 : W/2, wide ? 268 : 120);
-
-    var tx = wide ? 460 : W/2, maxW = wide ? 550 : 900;
-    var ty = wide ? 330 : cy + ch + 110;
-    x.textAlign = wide ? 'left' : 'center';
-
-    // Titel
-    x.fillStyle = '#e7ebf2'; x.font = 'bold 58px system-ui, Segoe UI, sans-serif';
-    var lines = wrapLines(x, d.title, maxW);
-    for (var i=0;i<lines.length;i++){ x.fillText(lines[i], tx, ty + i*70); }
-    ty += lines.length * 70 + (wide ? 50 : 70);
-
-    // Preis
-    x.fillStyle = '#4ade80'; x.font = 'bold 132px system-ui, Segoe UI, sans-serif';
-    x.fillText(eur(d.price), tx, ty);
-    ty += wide ? 80 : 96;
-
-    // Vergleichspreis durchgestrichen
-    if (d.oldPrice != null && d.oldPrice > d.price) {
-      x.fillStyle = '#8b93a7'; x.font = '46px system-ui, Segoe UI, sans-serif';
-      var oldTxt = 'statt ' + eur(d.oldPrice);
-      x.fillText(oldTxt, tx, ty);
-      var m = x.measureText(oldTxt);
-      var lx = wide ? tx : tx - m.width/2;
-      x.strokeStyle = '#f87171'; x.lineWidth = 4;
-      x.beginPath(); x.moveTo(lx, ty - 14); x.lineTo(lx + m.width, ty - 14); x.stroke();
-      ty += wide ? 80 : 100;
-    }
-
-    // Rabatt-Badge
-    if (d.cutPct != null && d.cutPct > 0) {
-      x.font = 'bold 52px system-ui, Segoe UI, sans-serif';
-      var bt = '−' + d.cutPct + '%';
-      var bw = x.measureText(bt).width + 60, bh = 84;
-      var bx = wide ? tx : tx - bw/2;
-      roundRect(x, bx, ty - 60, bw, bh, 42); x.fillStyle = '#4ade80'; x.fill();
-      x.fillStyle = '#04120a'; x.textAlign = 'center';
-      x.fillText(bt, bx + bw/2, ty - 2);
-      x.textAlign = wide ? 'left' : 'center';
-      ty += wide ? 80 : 110;
-    }
-
-    // Sonder-Banner
-    if (d.badge) {
-      x.fillStyle = '#fbbf24'; x.font = 'bold 44px system-ui, Segoe UI, sans-serif';
-      x.fillText('📉 ' + d.badge, tx, ty);
-      ty += wide ? 70 : 90;
-    }
-
-    // Shop
-    if (d.shop) {
-      x.fillStyle = '#8b93a7'; x.font = '40px system-ui, Segoe UI, sans-serif';
-      x.fillText('bei ' + d.shop, tx, ty);
-    }
-
-    // Fußzeile
-    x.textAlign = 'center'; x.fillStyle = '#5b6474';
-    x.font = 'bold 36px system-ui, Segoe UI, sans-serif';
-    x.fillText(BRAND, W/2, H - 60);
-  }
-
-  async function openShot(idx){
-    shotCur = SHOTS[idx];
-    if (!shotCur) return;
-    $('shotModal').classList.add('open');
-    await drawShot(shotCur, shotFmt);
-  }
-  function setFmt(f){
-    shotFmt = f;
-    $('fmt916').classList.toggle('on', f === '916');
-    $('fmt11').classList.toggle('on', f === '11');
-    if (shotCur) drawShot(shotCur, shotFmt);
-  }
-  $('fmt916').addEventListener('click', function(){ setFmt('916'); });
-  $('fmt11').addEventListener('click', function(){ setFmt('11'); });
-  $('shotClose').addEventListener('click', function(){ $('shotModal').classList.remove('open'); });
-  $('shotModal').addEventListener('click', function(e){ if (e.target === this) this.classList.remove('open'); });
-  $('shotDl').addEventListener('click', function(){
-    $('shotCanvas').toBlob(function(blob){
-      var name = (shotCur && shotCur.title ? shotCur.title : 'deal')
-        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
-      var a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = 'keysniper-' + name + '-' + shotFmt + '.png';
-      a.click();
-      setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1000);
-    }, 'image/png');
-  });
-  $('grid').addEventListener('click', function(e){
-    var b = e.target && e.target.closest ? e.target.closest('.shotbtn') : null;
-    if (b) openShot(+b.getAttribute('data-shot'));
   });
 
   load(false);
