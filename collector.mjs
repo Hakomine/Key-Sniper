@@ -201,8 +201,10 @@ async function fetchPopular() {
   }
 }
 
-// Persistente Genre-Datenbank (uuid -> tags[]). Nur neue Spiele werden geholt,
-// Genres ändern sich fast nie -> nach dem ersten Aufbau ist das ruckzuck.
+// Persistente Spiele-Datenbank (uuid -> { t: tags[], a: steamAppId }).
+// Beides ändert sich praktisch nie, deshalb wird pro Spiel nur einmal geholt.
+// Die Steam-ID ist der Schlüssel für die Keyshop-Preise von GG.deals.
+// Altes Format (nur ein tags-Array) wird beim nächsten Lauf automatisch ersetzt.
 const DB_PATH = path.join(__dirname, 'genres-db.json');
 function loadDb() {
   try {
@@ -211,11 +213,13 @@ function loadDb() {
     return {};
   }
 }
+const dbComplete = (e) => e && !Array.isArray(e) && typeof e === 'object' && 't' in e;
+
 async function enrichGenres(results) {
   const db = loadDb();
-  const need = [...new Set(results.map((r) => r.id))].filter((id) => !(id in db));
+  const need = [...new Set(results.map((r) => r.id))].filter((id) => !dbComplete(db[id]));
   if (need.length) {
-    console.log(`  Hole Genres für ${need.length} neue Spiele (einmalig, dauert etwas) ...`);
+    console.log(`  Hole Genres + Steam-IDs für ${need.length} Spiele (dauert etwas) ...`);
     let i = 0;
     let done = 0;
     const worker = async () => {
@@ -223,19 +227,25 @@ async function enrichGenres(results) {
         const id = need[i++];
         try {
           const info = await api('/games/info/v2', { query: { id } });
-          db[id] = Array.isArray(info.tags) ? info.tags : [];
+          db[id] = { t: Array.isArray(info.tags) ? info.tags : [], a: info.appid || null };
         } catch {
-          db[id] = [];
+          db[id] = { t: [], a: null };
         }
         done++;
-        if (done % 100 === 0) console.log(`  ... ${done}/${need.length} Genres geholt`);
+        if (done % 100 === 0) console.log(`  ... ${done}/${need.length} geholt`);
         await sleep(800);
       }
     };
     await Promise.all(Array.from({ length: 3 }, worker));
     fs.writeFileSync(DB_PATH, JSON.stringify(db));
   }
-  for (const r of results) r.tags = db[r.id] || [];
+  for (const r of results) {
+    const e = db[r.id];
+    r.tags = Array.isArray(e) ? e : (e && e.t) || [];
+    r.appid = Array.isArray(e) ? null : (e && e.a) || null;
+  }
+  const mitAppid = results.filter((r) => r.appid).length;
+  console.log(`  Steam-IDs vorhanden: ${mitAppid}/${results.length}`);
 }
 
 async function main() {

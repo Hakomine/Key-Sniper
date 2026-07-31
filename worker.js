@@ -31,10 +31,10 @@ const CACHE_SECONDS = 120; // Serverseitiger Cache fürs Live-Holen
 const RADAR_UNIVERSE = 100;      // Live-Fallback: ein GG.deals-Block
 const RADAR_CACHE = 1500;        // 25 Min Cache (frisch genug, schont Limit)
 const RADAR_NEAR_LOW_PCT = 15;   // "auf Keyshop-Tief"-Badge, wenn <= 15% über ATL
-const RADAR_MAX_OVER_LOW = 30;   // Aufnahme, wenn Keyshop <= 30% über Keyshop-Allzeittief
+const RADAR_MAX_OVER_LOW = 30;   // in die Liste, wenn Keyshop <= 30% über dem Tief …
+const RADAR_MIN_CUT = 35;        // … ODER mindestens 35% unter dem offiziellen Preis
 const RADAR_BLOCK = 100;         // Spiele pro GG.deals-Anfrage (Rate-Limit: 100/Min)
-const RADAR_BLOCKS = 5;          // rotierend -> 500 Spiele Gesamtabdeckung
-const RADAR_TOTAL = RADAR_BLOCK * RADAR_BLOCKS;
+const RADAR_TOTAL = 3000;      // Universumsgroesse: deckt auch Titel weit hinten ab
 const RADAR_BLOCK_TTL = 6 * 3600; // Blöcke 6 h gültig
 
 // Alarm (Cron): wann ist ein Deal "krass genug" zum Melden?
@@ -226,6 +226,24 @@ async function handleKeyshop(url, env, ctx) {
   return res;
 }
 
+// Spiele-DB aus GENRES_URL: uuid -> { tags, appid }.
+// Liefert Genres für den Filter und die Steam-ID für die Keyshop-Preise.
+// Verträgt das alte Format (reines tags-Array) mit.
+async function loadGameDb(env) {
+  const map = new Map();
+  if (!env.GENRES_URL) return map;
+  try {
+    const res = await fetch(env.GENRES_URL, { cf: { cacheTtl: 3600, cacheEverything: true } });
+    if (!res.ok) return map;
+    const raw = await res.json();
+    for (const k in raw) {
+      const e = raw[k];
+      map.set(k, Array.isArray(e) ? { tags: e, appid: null } : { tags: e.t || [], appid: e.a || null });
+    }
+  } catch {}
+  return map;
+}
+
 // ---------- Keyshop-Radar: neue Grau-Markt-Deals entdecken ----------
 
 // Universum: die beliebtesten kaufbaren Steam-Spiele (SteamSpy, nach Bewertungszahl)
@@ -256,8 +274,10 @@ async function scanKeyshops(ggKey, appids) {
     const retail = numPos(d.prices.currentRetail);
     const ksLow = numPos(d.prices.historicalKeyshops);
     if (!ks) continue;
+    // Keine Vorfilterung mehr: wer den Abstand zum Keyshop-Tief zu eng zieht,
+    // verliert Titel, die zwar über ihrem Tief liegen, aber massiv unter UVP sind.
     const overLowPct = ksLow != null ? Math.round((ks / ksLow - 1) * 100) : null;
-    if (overLowPct == null || overLowPct > RADAR_MAX_OVER_LOW) continue;
+    if (overLowPct == null) continue;
     const atKsLow = overLowPct <= RADAR_NEAR_LOW_PCT;
     const savingPct = retail != null ? Math.round((1 - ks / retail) * 100) : null;
     deals.push({ appid: +appid, title: d.title, keyshop: ks, retail, ksLow, overLowPct, savingPct, atKsLow, url: d.url || null });
@@ -273,7 +293,7 @@ async function handleRadar(url, env, ctx) {
   if (!fresh) {
     const merged = [];
     let newest = null;
-    for (let i = 0; i < RADAR_BLOCKS; i++) {
+    for (let i = 0; i < Math.ceil(RADAR_TOTAL / RADAR_BLOCK); i++) {
       const raw = await store.get(env, 'radar_block_' + i);
       if (!raw) continue;
       try {
@@ -285,7 +305,7 @@ async function handleRadar(url, env, ctx) {
       } catch {}
     }
     if (merged.length) {
-      merged.sort((a, b) => a.overLowPct - b.overLowPct);
+      merged.sort((a, b) => (b.savingPct || 0) - (a.savingPct || 0) || a.overLowPct - b.overLowPct);
       return json({
         generatedAt: newest || new Date().toISOString(),
         universe: RADAR_TOTAL,
@@ -326,17 +346,10 @@ async function buildDeals(env) {
   const key = env.ITAD_API_KEY;
   const LIMIT = 200;
 
-  // Genre-DB (optional) laden – für den Genre-Filter (aus GENRES_URL, 1h gecached)
+  // Spiele-DB (optional): Genres für den Filter, Steam-IDs für die Keyshop-Preise
   const genreMap = new Map();
-  if (env.GENRES_URL) {
-    try {
-      const gr = await fetch(env.GENRES_URL, { cf: { cacheTtl: 3600, cacheEverything: true } });
-      if (gr.ok) {
-        const gdb = await gr.json();
-        for (const k in gdb) genreMap.set(k, gdb[k]);
-      }
-    } catch {}
-  }
+  const db = await loadGameDb(env);
+  for (const [id, e] of db) genreMap.set(id, e.tags);
 
   // 1) Deals (tiefste Rabatte) UND beliebteste Spiele parallel holen
   const dealsPromise = (async () => {
@@ -533,6 +546,9 @@ async function runCron(env) {
     errors.push('Radar: ' + e.message);
   }
 
+  // Krasseste zuerst – sonst verdrängen viele normale Treffer die Keyshop-Funde
+  // aus den zehn Embeds, die Discord pro Nachricht erlaubt.
+  alerts.sort((a, b) => alertScore(b) - alertScore(a));
   if (alerts.length) await sendDiscord(env, alerts);
 
   // Zustand festhalten – daran erkennt der externe Watchdog, ob es noch lebt
@@ -593,6 +609,13 @@ async function dailyReport(env, checked, alerts) {
   });
 }
 
+// Rangfolge für die Discord-Meldung: Allzeittiefs schlagen alles,
+// danach zählt, wie stark reduziert der Treffer ist.
+function alertScore(h) {
+  if (h.kind === 'keyshop') return (h.atKsLow ? 1000 : 0) + (h.savingPct || 0);
+  return (h.atHistLow ? 1000 : 0) + (h.gapPct || 0);
+}
+
 // Schlanker Alarm-Pfad (2 API-Calls, wenig CPU).
 // Basis sind bewusst die BELIEBTESTEN Spiele, nicht die höchsten Rabatte:
 // "-cut" liefert fast nur Nischen-Ramsch mit absurdem Listenpreis, während hier
@@ -650,26 +673,62 @@ async function alarmDeals(env) {
 
 // Pro Lauf einen 100er-Block scannen und in den Speicher legen. Nach RADAR_BLOCKS
 // Läufen ist das ganze Universum (RADAR_TOTAL Spiele) abgedeckt.
+// Universum: die RADAR_TOTAL meistverbreiteten Steam-Spiele, einmal täglich
+// geholt und im Speicher gehalten (SteamSpy liefert 1000 pro Seite).
+// Wichtig ist die Größe: Keyshop-Schnäppchen betreffen oft Titel weit hinten –
+// "Still Wakes the Deep" steht z.B. erst auf Platz ~4900.
+async function radarUniverse(env) {
+  const cached = await store.get(env, 'radar_pool');
+  if (cached) {
+    try {
+      const ids = JSON.parse(cached);
+      if (Array.isArray(ids) && ids.length) return ids;
+    } catch {}
+  }
+  const ids = [];
+  for (let page = 0; page * 1000 < RADAR_TOTAL; page++) {
+    const res = await fetch('https://steamspy.com/api.php?request=all&page=' + page);
+    if (!res.ok) break;
+    const data = await res.json();
+    for (const g of Object.values(data)) if (g && +g.price > 0) ids.push(g.appid);
+    if (ids.length >= RADAR_TOTAL) break;
+  }
+  const pool = ids.slice(0, RADAR_TOTAL);
+  if (pool.length) await store.put(env, 'radar_pool', JSON.stringify(pool), 24 * 3600);
+  return pool;
+}
+
+// Pro Lauf ein 100er-Block, der Cursor wandert durch das ganze Universum.
+// Bei 10-Minuten-Takt sind das 600 Spiele pro Stunde.
 async function rotateRadar(env) {
   const ggKey = env.GGDEALS_API_KEY;
   if (!ggKey) return [];
 
-  const cur = (+(await store.get(env, 'radar_cursor')) || 0) % RADAR_BLOCKS;
-  const universe = await steamUniverse(RADAR_TOTAL);
-  const block = universe.slice(cur * RADAR_BLOCK, (cur + 1) * RADAR_BLOCK);
+  const pool = await radarUniverse(env);
+  if (!pool.length) return [];
+
+  const blocks = Math.max(1, Math.ceil(pool.length / RADAR_BLOCK));
+  const cur = (+(await store.get(env, 'radar_cursor')) || 0) % blocks;
+  const block = pool.slice(cur * RADAR_BLOCK, (cur + 1) * RADAR_BLOCK);
   if (!block.length) return [];
 
   const deals = await scanKeyshops(ggKey, block);
+  // Für die Radar-Ansicht: nah am Keyshop-Tief oder deutlich unter dem offiziellen Preis
+  const keep = deals.filter(
+    (d) => d.overLowPct <= RADAR_MAX_OVER_LOW || (d.savingPct != null && d.savingPct >= RADAR_MIN_CUT)
+  );
   await store.put(
     env,
     'radar_block_' + cur,
-    JSON.stringify({ at: new Date().toISOString(), deals }),
+    JSON.stringify({ at: new Date().toISOString(), deals: keep }),
     RADAR_BLOCK_TTL
   );
-  await store.put(env, 'radar_cursor', String((cur + 1) % RADAR_BLOCKS), 30 * 24 * 3600);
+  await store.put(env, 'radar_cursor', String((cur + 1) % blocks), 30 * 24 * 3600);
 
-  // Melden nur bei echtem Keyshop-Allzeittief
-  const hits = deals
+  // Alarm nur beim Keyshop-Allzeittief: "so billig war es dort noch nie".
+  // Gemessen ergibt das ~12 Meldungen pro Durchlauf. Ein reines Rabatt-Kriterium
+  // wäre wertlos – 90 % unter UVP ist bei Keyshops Alltag.
+  const hits = keep
     .filter((d) => d.overLowPct <= 0)
     .map((d) => ({
       key: 'ks:' + d.appid,
@@ -678,6 +737,8 @@ async function rotateRadar(env) {
       title: d.title,
       keyshop: d.keyshop,
       retail: d.retail,
+      cutPct: d.savingPct,
+      atKsLow: d.overLowPct <= 0,
       savingPct: d.savingPct,
       boxart: 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + d.appid + '/library_600x900.jpg',
       link: d.url,
@@ -717,8 +778,11 @@ async function sendDiscord(env, hits) {
           title: '🔥 ' + h.title,
           url: h.link || undefined,
           description:
-            'Keyshop auf **Allzeittief**: **' + eurTxt(h.keyshop) + '**' +
-            (h.savingPct != null && h.savingPct > 0 ? ' · −' + h.savingPct + '% ggü. offiziell' : ''),
+            'Keyshop: **' + eurTxt(h.keyshop) + '**' +
+            (h.savingPct != null && h.savingPct > 0
+              ? ' · **−' + h.savingPct + '%** gegenüber ' + eurTxt(h.retail)
+              : '') +
+            (h.atKsLow ? '\n📉 **So billig war es dort noch nie**' : ''),
           color: 3718648,
           thumbnail: h.boxart ? { url: h.boxart } : undefined,
           footer: { text: 'Keyshop-Radar (Grau-Markt) · GG.deals' },
@@ -1010,14 +1074,15 @@ const HTML = `<!doctype html>
       var d = new Date(RADAR.generatedAt);
       $('meta').textContent = 'Radar-Stand: ' + d.toLocaleTimeString('de-DE') + ' · ' + RADAR.deals.length + ' Keyshop-Deals';
     }
-    $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den beliebtesten Spielen – nach Abstand zum Keyshop-Allzeittief sortiert';
+    $('summary').textContent = RADAR.deals.length + ' Keyshop-Deals (Grau-Markt) aus den aktuellen Angeboten – stärkster Rabatt zuerst';
     var out = [];
     for (var i=0;i<RADAR.deals.length;i++){
       var r = RADAR.deals[i];
       var over = (r.overLowPct != null && r.overLowPct <= 0)
         ? '<span class="badge low">🔥 Keyshop-Allzeittief</span>'
-        : '<span class="' + (r.atKsLow ? 'badge low' : 'badge gap') + '">' + r.overLowPct + '% über Keyshop-Tief</span>';
-      var sav = (r.savingPct != null && r.savingPct > 0) ? '<span class="badge">−'+r.savingPct+'% ggü. offiziell</span>' : '';
+        : '<span class="' + (r.atKsLow ? 'badge low' : 'badge') + '">' + r.overLowPct + '% über Keyshop-Tief</span>';
+      var sav = (r.savingPct != null && r.savingPct > 0)
+        ? '<span class="badge gap">−'+r.savingPct+'% ggü. '+eur(r.retail)+'</span>' : '';
       var cov = 'https://cdn.cloudflare.steamstatic.com/steam/apps/'+r.appid+'/library_600x900.jpg';
       var box = '<img class="box" src="'+cov+'" alt="" loading="lazy" onerror="this.style.display=\\'none\\'">';
       out.push(
