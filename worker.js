@@ -4,13 +4,23 @@
 //   /            -> die App (HTML)
 //   /api/deals   -> holt live die Deals von IsThereAnyDeal, rechnet Preislücken
 //                   (?fresh=1 umgeht den Cache)
+//   /api/keyshop -> Keyshop-Preis für ein Spiel (GG.deals, auf Abruf)
+//   /api/radar   -> Keyshop-Radar (Grau-Markt-Deals)
 //   /go?u=...    -> löst einen itad.link-Redirect auf und leitet direkt zum Shop
+//
+// Cron (scheduled): meldet krasse Deals per Discord und scannt rotierend
+//                   mehr Spiele für den Radar.
 //
 // Einrichtung im Cloudflare-Dashboard:
 //   1) Worker anlegen, diesen Code einfügen, Deploy.
-//   2) Settings -> Variables and Secrets -> Secret hinzufügen:
-//        Name: ITAD_API_KEY   Wert: dein ITAD-Key
-//   3) Worker-URL öffnen. Fertig.
+//   2) Settings -> Variables and Secrets:
+//        Secret   ITAD_API_KEY      dein ITAD-Key
+//        Secret   GGDEALS_API_KEY   dein GG.deals-Key (Keyshop-Preise/Radar)
+//        Secret   DISCORD_WEBHOOK   Webhook-URL für den Alarm (optional)
+//        Variable GENRES_URL        raw-URL zu genres-db.json (optional, Genres)
+//   3) Settings -> Bindings: KV-Namespace als  SNIPER_KV  binden (für den Alarm).
+//   4) Settings -> Trigger Events -> Cron Trigger:  */10 * * * *
+//   5) Worker-URL öffnen. Fertig.
 
 const COUNTRY = 'DE';
 const MAX_GAMES = 600;
@@ -18,10 +28,22 @@ const HIST_TOL_PCT = 5;   // "auf Historical Low", wenn <= ATL * (1 + 5%)
 const CACHE_SECONDS = 120; // Serverseitiger Cache fürs Live-Holen
 
 // Keyshop-Radar: die N beliebtesten Steam-Spiele auf Keyshop-Deals abklopfen
-const RADAR_UNIVERSE = 100;      // 100 = ein GG.deals-Block (Rate-Limit-konform)
+const RADAR_UNIVERSE = 100;      // Live-Fallback: ein GG.deals-Block
 const RADAR_CACHE = 1500;        // 25 Min Cache (frisch genug, schont Limit)
 const RADAR_NEAR_LOW_PCT = 15;   // "auf Keyshop-Tief"-Badge, wenn <= 15% über ATL
 const RADAR_MAX_OVER_LOW = 30;   // Aufnahme, wenn Keyshop <= 30% über Keyshop-Allzeittief
+const RADAR_BLOCK = 100;         // Spiele pro GG.deals-Anfrage (Rate-Limit: 100/Min)
+const RADAR_BLOCKS = 5;          // rotierend -> 500 Spiele Gesamtabdeckung
+const RADAR_TOTAL = RADAR_BLOCK * RADAR_BLOCKS;
+const RADAR_BLOCK_TTL = 6 * 3600; // Blöcke 6 h gültig
+
+// Alarm (Cron): wann ist ein Deal "krass genug" zum Melden?
+const ALARM_MIN_GAP = 7;        // € Preislücke zum zweitbilligsten Shop
+const ALARM_HISTLOW_GAP = 3;    // bei Historical Low reicht diese kleinere Lücke
+const ALARM_SCAN = 200;         // Spiele pro Alarm-Lauf (schlank wegen CPU-Limit)
+const ALARM_TTL = 14 * 24 * 3600; // so lange gilt ein Deal als "schon gemeldet"
+const ALARM_REDROP_PCT = 10;    // erneut melden, wenn Preis nochmal 10% fällt
+const ALARM_MAX_EMBEDS = 10;    // Discord erlaubt max. 10 Embeds pro Nachricht
 
 const numPos = (x) => (x != null && +x > 0 ? +x : null);
 
@@ -85,6 +107,30 @@ export default {
     return new Response(HTML, {
       headers: { 'content-type': 'text/html; charset=utf-8' },
     });
+  },
+
+  // Cron: läuft im Hintergrund (Trigger im Dashboard, z.B. */10 * * * *)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runCron(env));
+  },
+};
+
+// ---------- kleiner Key-Value-Speicher ----------
+// Nutzt den KV-Namespace SNIPER_KV, falls gebunden. Ohne KV fällt er auf die
+// Cache-API zurück – die ist nicht garantiert persistent, deshalb ist KV besser.
+const store = {
+  _req: (k) => new Request('https://key-sniper.state/' + encodeURIComponent(k)),
+  async get(env, k) {
+    if (env.SNIPER_KV) return env.SNIPER_KV.get(k);
+    const hit = await caches.default.match(store._req(k));
+    return hit ? await hit.text() : null;
+  },
+  async put(env, k, v, ttl) {
+    if (env.SNIPER_KV) return env.SNIPER_KV.put(k, v, { expirationTtl: ttl });
+    return caches.default.put(
+      store._req(k),
+      new Response(v, { headers: { 'Cache-Control': 'public, max-age=' + ttl } })
+    );
   },
 };
 
@@ -164,15 +210,80 @@ async function handleKeyshop(url, env, ctx) {
 }
 
 // ---------- Keyshop-Radar: neue Grau-Markt-Deals entdecken ----------
-// Universum: die RADAR_UNIVERSE beliebtesten Steam-Spiele (SteamSpy, nach
-// Bewertungszahl). Preise von GG.deals. Live, alle ~25 Min neu gescannt.
+
+// Universum: die beliebtesten kaufbaren Steam-Spiele (SteamSpy, nach Bewertungszahl)
+async function steamUniverse(limit) {
+  const res = await fetch('https://steamspy.com/api.php?request=all&page=0');
+  if (!res.ok) throw new Error('SteamSpy HTTP ' + res.status);
+  const ss = await res.json();
+  return Object.values(ss)
+    .filter((g) => g && +g.price > 0)
+    .sort((a, b) => (b.positive + b.negative || 0) - (a.positive + a.negative || 0))
+    .slice(0, limit)
+    .map((g) => g.appid);
+}
+
+// Keyshop-Preise für einen Block App-IDs holen und auf Schnäppchen filtern.
+// Vergleich Keyshop-gegen-Keyshop: wie weit über dem eigenen Allzeittief?
+async function scanKeyshops(ggKey, appids) {
+  const gg = await fetch(
+    'https://api.gg.deals/v1/prices/by-steam-app-id/?ids=' + appids.join(',') +
+      '&region=' + COUNTRY.toLowerCase() + '&key=' + encodeURIComponent(ggKey)
+  );
+  const gj = await gg.json();
+  const data = (gj && gj.data) || {};
+  const deals = [];
+  for (const [appid, d] of Object.entries(data)) {
+    if (!d || !d.prices) continue;
+    const ks = numPos(d.prices.currentKeyshops);
+    const retail = numPos(d.prices.currentRetail);
+    const ksLow = numPos(d.prices.historicalKeyshops);
+    if (!ks) continue;
+    const overLowPct = ksLow != null ? Math.round((ks / ksLow - 1) * 100) : null;
+    if (overLowPct == null || overLowPct > RADAR_MAX_OVER_LOW) continue;
+    const atKsLow = overLowPct <= RADAR_NEAR_LOW_PCT;
+    const savingPct = retail != null ? Math.round((1 - ks / retail) * 100) : null;
+    deals.push({ appid: +appid, title: d.title, keyshop: ks, retail, ksLow, overLowPct, savingPct, atKsLow, url: d.url || null });
+  }
+  return deals;
+}
+
+// Bevorzugt die vom Cron rotierend befüllten Blöcke (großes Universum).
+// Nur solange die noch leer sind, wird live ein einzelner Block gescannt.
 async function handleRadar(url, env, ctx) {
+  const fresh = new URL(url).searchParams.get('fresh') === '1';
+
+  if (!fresh) {
+    const merged = [];
+    let newest = null;
+    for (let i = 0; i < RADAR_BLOCKS; i++) {
+      const raw = await store.get(env, 'radar_block_' + i);
+      if (!raw) continue;
+      try {
+        const b = JSON.parse(raw);
+        if (b && Array.isArray(b.deals)) {
+          merged.push(...b.deals);
+          if (!newest || b.at > newest) newest = b.at;
+        }
+      } catch {}
+    }
+    if (merged.length) {
+      merged.sort((a, b) => a.overLowPct - b.overLowPct);
+      return json({
+        generatedAt: newest || new Date().toISOString(),
+        universe: RADAR_TOTAL,
+        count: merged.length,
+        deals: merged,
+      });
+    }
+  }
+
+  // Fallback: live einen Block scannen (bis der Cron die Blöcke gefüllt hat)
   const ggKey = env.GGDEALS_API_KEY;
   if (!ggKey) return json({ error: 'GGDEALS_API_KEY fehlt (als Secret setzen)' }, 500);
 
   const cache = caches.default;
   const cacheKey = new Request('https://key-sniper.cache/radar?r=' + COUNTRY);
-  const fresh = new URL(url).searchParams.get('fresh') === '1';
   if (!fresh) {
     const hit = await cache.match(cacheKey);
     if (hit) return hit;
@@ -180,38 +291,8 @@ async function handleRadar(url, env, ctx) {
 
   let out;
   try {
-    // 1) Universum: beliebteste kaufbare Steam-Spiele
-    const ssRes = await fetch('https://steamspy.com/api.php?request=all&page=0');
-    if (!ssRes.ok) throw new Error('SteamSpy HTTP ' + ssRes.status);
-    const ss = await ssRes.json();
-    const games = Object.values(ss)
-      .filter((g) => g && +g.price > 0)
-      .sort((a, b) => (b.positive + b.negative || 0) - (a.positive + a.negative || 0))
-      .slice(0, RADAR_UNIVERSE);
-    const appids = games.map((g) => g.appid);
-
-    // 2) Keyshop-Preise (ein Block, region-genau)
-    const gg = await fetch(
-      'https://api.gg.deals/v1/prices/by-steam-app-id/?ids=' + appids.join(',') +
-        '&region=' + COUNTRY.toLowerCase() + '&key=' + encodeURIComponent(ggKey)
-    );
-    const gj = await gg.json();
-    const data = (gj && gj.data) || {};
-
-    const deals = [];
-    for (const [appid, d] of Object.entries(data)) {
-      if (!d || !d.prices) continue;
-      const ks = numPos(d.prices.currentKeyshops);
-      const retail = numPos(d.prices.currentRetail);
-      const ksLow = numPos(d.prices.historicalKeyshops);
-      if (!ks) continue;
-      // Vergleich Keyshop-gegen-Keyshop: wie weit über dem eigenen Allzeittief?
-      const overLowPct = ksLow != null ? Math.round((ks / ksLow - 1) * 100) : null;
-      if (overLowPct == null || overLowPct > RADAR_MAX_OVER_LOW) continue;
-      const atKsLow = overLowPct <= RADAR_NEAR_LOW_PCT;
-      const savingPct = retail != null ? Math.round((1 - ks / retail) * 100) : null;
-      deals.push({ appid: +appid, title: d.title, keyshop: ks, retail, ksLow, overLowPct, savingPct, atKsLow, url: d.url || null });
-    }
+    const appids = await steamUniverse(RADAR_UNIVERSE);
+    const deals = await scanKeyshops(ggKey, appids);
     deals.sort((a, b) => a.overLowPct - b.overLowPct); // am nächsten am Keyshop-Tief zuerst
     out = { generatedAt: new Date().toISOString(), universe: RADAR_UNIVERSE, count: deals.length, deals };
   } catch (e) {
@@ -340,23 +421,204 @@ async function itad(path, { method = 'GET', query = {}, body, key } = {}) {
 
 // ---------- /go: itad.link -> direkter Shop-Link ----------
 
-async function handleGo(url) {
-  let target = url.searchParams.get('u');
-  if (!target) return new Response('missing u', { status: 400 });
+// Löst einen itad.link-Redirect zur echten Shop-URL auf.
+// Bei Fehler kommt der Original-Link zurück (Link funktioniert immer).
+async function resolveStoreUrl(u) {
   try {
-    let cur = target;
+    let cur = u;
     for (let i = 0; i < 5; i++) {
       const r = await fetch(cur, { method: 'GET', redirect: 'manual' });
       const loc = r.headers.get('location');
       if ([301, 302, 303, 307, 308].includes(r.status) && loc) {
         cur = new URL(loc, cur).href;
-        if (!/itad\.link|isthereanydeal\.com/.test(cur)) { target = cur; break; }
-      } else { target = cur; break; }
+        if (!/itad\.link|isthereanydeal\.com/.test(cur)) return cur;
+      } else return cur;
     }
+    return cur;
   } catch (e) {
-    // Fallback: Original-Link
+    return u;
   }
-  return Response.redirect(target, 302);
+}
+
+async function handleGo(url) {
+  const target = url.searchParams.get('u');
+  if (!target) return new Response('missing u', { status: 400 });
+  return Response.redirect(await resolveStoreUrl(target), 302);
+}
+
+// ---------- Cron: Alarm melden + Radar rotierend füllen ----------
+
+async function runCron(env) {
+  const alerts = [];
+  try {
+    alerts.push(...(await alarmDeals(env)));
+  } catch (e) {
+    console.log('Alarm-Check fehlgeschlagen: ' + e.message);
+  }
+  try {
+    alerts.push(...(await rotateRadar(env)));
+  } catch (e) {
+    console.log('Radar-Rotation fehlgeschlagen: ' + e.message);
+  }
+  if (alerts.length) await sendDiscord(env, alerts);
+  console.log('Cron fertig – ' + alerts.length + ' neue Alarme');
+}
+
+// Schlanker Alarm-Pfad (2 API-Calls, wenig CPU).
+// Basis sind bewusst die BELIEBTESTEN Spiele, nicht die höchsten Rabatte:
+// "-cut" liefert fast nur Nischen-Ramsch mit absurdem Listenpreis, während hier
+// Titel kommen, die man wirklich haben will. Volle Analyse macht /api/deals.
+async function alarmDeals(env) {
+  const key = env.ITAD_API_KEY;
+  if (!key) return [];
+
+  const popular = await itad('/stats/most-popular/v1', { query: { limit: ALARM_SCAN }, key });
+  const list = Array.isArray(popular) ? popular : [];
+  if (!list.length) return [];
+
+  const meta = new Map();
+  for (const c of list) if (c && c.id && !meta.has(c.id)) meta.set(c.id, c);
+  const prices = await itad('/games/prices/v3', {
+    method: 'POST',
+    query: { country: COUNTRY, capacity: 0 },
+    body: [...meta.keys()],
+    key,
+  });
+
+  const hits = [];
+  for (const g of prices || []) {
+    const c = meta.get(g.id);
+    if (!c) continue;
+    const histLow = g.historyLow && g.historyLow.all ? g.historyLow.all.amount : null;
+    const v = analyze(g.deals, REPUTABLE, histLow);
+    if (!v) continue;
+    // "Krass genug": große Lücke, oder Historical Low mit spürbarer Lücke
+    if (!(v.gapAbs >= ALARM_MIN_GAP || (v.atHistLow && v.gapAbs >= ALARM_HISTLOW_GAP))) continue;
+    hits.push({
+      key: 'deal:' + g.id,
+      kind: 'deal',
+      price: v.cheapest.price,
+      title: c.title,
+      shop: v.cheapest.shop,
+      gapAbs: v.gapAbs,
+      gapPct: v.gapPct,
+      atHistLow: v.atHistLow,
+      steam: v.cheapest.steam,
+      boxart: 'https://assets.isthereanydeal.com/' + g.id + '/boxart.jpg',
+      link: rawShopUrl(v.cheapest.url),
+    });
+  }
+
+  // Beste zuerst (Historical Low schlägt große Lücke) – die Top-Treffer landen
+  // so im Discord-Embed, falls mal viele auf einmal auftauchen.
+  hits.sort((a, b) => (b.atHistLow ? 1 : 0) - (a.atHistLow ? 1 : 0) || b.gapAbs - a.gapAbs);
+
+  const fresh = await onlyNew(env, hits);
+  // Shop-Links nur für die tatsächlich gezeigten Treffer auflösen (spart Requests)
+  for (const h of fresh.slice(0, ALARM_MAX_EMBEDS)) h.link = await resolveStoreUrl(h.link);
+  return fresh;
+}
+
+// Pro Lauf einen 100er-Block scannen und in den Speicher legen. Nach RADAR_BLOCKS
+// Läufen ist das ganze Universum (RADAR_TOTAL Spiele) abgedeckt.
+async function rotateRadar(env) {
+  const ggKey = env.GGDEALS_API_KEY;
+  if (!ggKey) return [];
+
+  const cur = (+(await store.get(env, 'radar_cursor')) || 0) % RADAR_BLOCKS;
+  const universe = await steamUniverse(RADAR_TOTAL);
+  const block = universe.slice(cur * RADAR_BLOCK, (cur + 1) * RADAR_BLOCK);
+  if (!block.length) return [];
+
+  const deals = await scanKeyshops(ggKey, block);
+  await store.put(
+    env,
+    'radar_block_' + cur,
+    JSON.stringify({ at: new Date().toISOString(), deals }),
+    RADAR_BLOCK_TTL
+  );
+  await store.put(env, 'radar_cursor', String((cur + 1) % RADAR_BLOCKS), 30 * 24 * 3600);
+
+  // Melden nur bei echtem Keyshop-Allzeittief
+  const hits = deals
+    .filter((d) => d.overLowPct <= 0)
+    .map((d) => ({
+      key: 'ks:' + d.appid,
+      kind: 'keyshop',
+      price: d.keyshop,
+      title: d.title,
+      keyshop: d.keyshop,
+      retail: d.retail,
+      savingPct: d.savingPct,
+      boxart: 'https://cdn.cloudflare.steamstatic.com/steam/apps/' + d.appid + '/library_600x900.jpg',
+      link: d.url,
+    }));
+  return onlyNew(env, hits);
+}
+
+// Dedup: schon gemeldete Deals nur erneut melden, wenn der Preis nochmal fällt.
+async function onlyNew(env, hits) {
+  const out = [];
+  for (const h of hits) {
+    const k = 'alerted:' + h.key;
+    const prev = await store.get(env, k);
+    const prevPrice = prev != null ? +prev : null;
+    if (prevPrice != null && !(h.price <= prevPrice * (1 - ALARM_REDROP_PCT / 100))) continue;
+    out.push(h);
+    await store.put(env, k, String(h.price), ALARM_TTL);
+  }
+  return out;
+}
+
+const eurTxt = (n) => (n == null ? '–' : (+n).toFixed(2).replace('.', ',') + ' €');
+const rawShopUrl = (goUrl) => {
+  const i = (goUrl || '').indexOf('u=');
+  return i === -1 ? goUrl : decodeURIComponent(goUrl.slice(i + 2));
+};
+
+async function sendDiscord(env, hits) {
+  const hook = env.DISCORD_WEBHOOK;
+  if (!hook) {
+    console.log('DISCORD_WEBHOOK fehlt – ' + hits.length + ' Treffer nicht gesendet');
+    return;
+  }
+  const embeds = hits.slice(0, ALARM_MAX_EMBEDS).map((h) =>
+    h.kind === 'keyshop'
+      ? {
+          title: '🔥 ' + h.title,
+          url: h.link || undefined,
+          description:
+            'Keyshop auf **Allzeittief**: **' + eurTxt(h.keyshop) + '**' +
+            (h.savingPct != null && h.savingPct > 0 ? ' · −' + h.savingPct + '% ggü. offiziell' : ''),
+          color: 3718648,
+          thumbnail: h.boxart ? { url: h.boxart } : undefined,
+          footer: { text: 'Keyshop-Radar (Grau-Markt) · GG.deals' },
+        }
+      : {
+          title: (h.atHistLow ? '📉 ' : '🎯 ') + h.title,
+          url: h.link || undefined,
+          description:
+            '**' + eurTxt(h.price) + '** bei **' + h.shop + '**\n' +
+            h.gapAbs + ' € / ' + h.gapPct + '% Lücke zum zweitbilligsten Shop' +
+            (h.atHistLow ? '\n📉 **Historical Low**' : '') +
+            (h.steam ? '\nSteam-Key' : ''),
+          color: h.atHistLow ? 16498468 : 4906624,
+          thumbnail: h.boxart ? { url: h.boxart } : undefined,
+          footer: { text: 'Key Sniper · seriöse Stores' },
+        }
+  );
+
+  const more = hits.length > ALARM_MAX_EMBEDS ? ' (+' + (hits.length - ALARM_MAX_EMBEDS) + ' weitere)' : '';
+  const res = await fetch(hook, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      username: 'Key Sniper',
+      content: '🎯 **' + hits.length + (hits.length === 1 ? ' neuer Deal' : ' neue Deals') + '**' + more,
+      embeds,
+    }),
+  });
+  if (!res.ok) console.log('Discord HTTP ' + res.status);
 }
 
 function json(obj, status = 200) {
