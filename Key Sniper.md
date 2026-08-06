@@ -78,11 +78,18 @@ Keys stehen **nicht** in diesen Dateien: lokal in `key.txt` / `ggkey.txt` (beide
   bewusst schlank (2 API-Calls). Bei `Exceeded CPU limit` in den Logs: auf GitHub
   Actions ausweichen.
 
-- **Node-fetch hat kein Zeitlimit.** Der Genre-Job hing einmal 15 Minuten
-  (normal: 1 Minute) und wurde von GitHub kommentarlos abgebrochen – Job-Status
-  „cancelled", keine Fehlermeldung. Ursache: `fetch` ohne `signal` wartet
-  endlos, wenn ITAD die Verbindung offen lässt. Jetzt 20 s Zeitlimit, maximal
-  5 Rate-Limit-Runden, `retry-after` auf 60 s gedeckelt und
+- **„Cancelled" nach genau ~15 Minuten heißt: kein Runner, nicht kaputt.**
+  Am 06.08.2026 schlugen ab 16:00 alle Jobs fehl, jeder exakt ~905 Sekunden
+  lang. Das sah nach einem hängenden Sammler aus, war aber eine kritische
+  GitHub-Actions-Störung: die Jobs bekamen nie einen Runner und wurden nach
+  der Wartezeit abgebrochen. **Erkennungsmerkmal**, über die API abfragbar
+  unter `/actions/runs/<id>/jobs`: `runner_name` leer und `steps` leer. Dann
+  ist nichts gelaufen, und kein Code der Welt behebt es. Gegenprobe:
+  <https://www.githubstatus.com>.
+- **Node-fetch hat trotzdem kein Zeitlimit.** Bei der Fehlersuche aufgefallen,
+  auch wenn es diesmal nicht die Ursache war: `fetch` ohne `signal` wartet
+  endlos, wenn die Gegenstelle die Verbindung offen lässt. Abgesichert mit 20 s
+  Zeitlimit, maximal 5 Rate-Limit-Runden, `retry-after` auf 60 s gedeckelt und
   `timeout-minutes: 8` im Workflow.
 
 ## Notizen
