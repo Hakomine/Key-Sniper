@@ -78,6 +78,13 @@ Keys stehen **nicht** in diesen Dateien: lokal in `key.txt` / `ggkey.txt` (beide
   bewusst schlank (2 API-Calls). Bei `Exceeded CPU limit` in den Logs: auf GitHub
   Actions ausweichen.
 
+- **Node-fetch hat kein Zeitlimit.** Der Genre-Job hing einmal 15 Minuten
+  (normal: 1 Minute) und wurde von GitHub kommentarlos abgebrochen – Job-Status
+  „cancelled", keine Fehlermeldung. Ursache: `fetch` ohne `signal` wartet
+  endlos, wenn ITAD die Verbindung offen lässt. Jetzt 20 s Zeitlimit, maximal
+  5 Rate-Limit-Runden, `retry-after` auf 60 s gedeckelt und
+  `timeout-minutes: 8` im Workflow.
+
 ## Notizen
 - Region steht auf DE/EUR (`COUNTRY` in `worker.js`, `country` in `config.json`).
 - Das Repo ist **öffentlich** auf GitHub – hier also nichts Privates reinschreiben.

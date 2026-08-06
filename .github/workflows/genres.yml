@@ -15,6 +15,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Normale Läufe brauchen ~1 Minute. Ohne Grenze hing der Job einmal 15
+    # Minuten und wurde dann ohne verwertbare Meldung abgebrochen. So scheitert
+    # er schnell und mit klarer Ursache.
+    timeout-minutes: 8
     steps:
       - name: Code holen
         uses: actions/checkout@v7

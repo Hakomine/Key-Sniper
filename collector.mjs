@@ -37,24 +37,49 @@ if (!KEY || KEY.startsWith('HIER')) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function api(pathname, { method = 'GET', query = {}, body } = {}) {
+// Node hat für fetch KEIN eingebautes Zeitlimit. Ohne das hier hängt der Job,
+// wenn ITAD die Verbindung offen lässt statt zu antworten – der Genre-Job lief
+// deshalb einmal 15 Minuten statt einer, bis GitHub ihn abgebrochen hat.
+const API_TIMEOUT_MS = 20000;
+const API_MAX_429 = 5;      // danach lieber sauber abbrechen als ewig kreisen
+const API_MAX_WAIT_S = 60;  // ein großes retry-after nicht blind befolgen
+const API_MAX_NETZ = 2;     // Wiederholungen bei Netzfehler/Zeitüberschreitung
+
+async function api(pathname, { method = 'GET', query = {}, body, n429 = 0, nNetz = 0 } = {}) {
   const u = new URL(BASE + pathname);
   u.searchParams.set('key', KEY);
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
   }
-  const opt = { method, headers: {} };
+  const opt = { method, headers: {}, signal: AbortSignal.timeout(API_TIMEOUT_MS) };
   if (body !== undefined) {
     opt.headers['Content-Type'] = 'application/json';
     opt.body = JSON.stringify(body);
   }
-  const res = await fetch(u, opt);
-  if (res.status === 429) {
-    const wait = (+(res.headers.get('retry-after') || '30') + 1) * 1000;
-    console.log(`  Rate-Limit erreicht, warte ${wait / 1000}s ...`);
-    await sleep(wait);
-    return api(pathname, { method, query, body });
+
+  let res;
+  try {
+    res = await fetch(u, opt);
+  } catch (e) {
+    // Zeitüberschreitung oder Netzfehler: kurz warten und nochmal, aber begrenzt
+    if (nNetz >= API_MAX_NETZ) {
+      throw new Error(`${method} ${pathname} -> ${e.name === 'TimeoutError' ? 'Zeitüberschreitung' : 'Netzfehler'}: ${e.message}`);
+    }
+    console.log(`  ${pathname}: ${e.name}, Versuch ${nNetz + 2} von ${API_MAX_NETZ + 1} ...`);
+    await sleep(3000 * (nNetz + 1));
+    return api(pathname, { method, query, body, n429, nNetz: nNetz + 1 });
   }
+
+  if (res.status === 429) {
+    if (n429 >= API_MAX_429) {
+      throw new Error(`${method} ${pathname} -> ${API_MAX_429}x Rate-Limit, Abbruch`);
+    }
+    const wait = Math.min(+(res.headers.get('retry-after') || '30') + 1, API_MAX_WAIT_S) * 1000;
+    console.log(`  Rate-Limit erreicht, warte ${wait / 1000}s (${n429 + 1}/${API_MAX_429}) ...`);
+    await sleep(wait);
+    return api(pathname, { method, query, body, n429: n429 + 1, nNetz });
+  }
+
   if (!res.ok) {
     throw new Error(`${method} ${pathname} -> HTTP ${res.status}\n${await res.text()}`);
   }
