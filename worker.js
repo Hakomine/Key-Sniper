@@ -502,7 +502,29 @@ async function handleHealth(env) {
     return json({ ok: false, reason: 'Zustand unlesbar' }, 503);
   }
   const ageMinutes = Math.round((Date.now() - new Date(h.at).getTime()) / 60000);
-  return json({ ...h, ageMinutes });
+
+  // Das Lebenszeichen vom Anfang des Cron-Laufs. Der Vergleich beider Zeiten
+  // sagt, WO es klemmt:
+  //   beide alt          -> der Cron feuert gar nicht (Trigger/Plattform)
+  //   Lebenszeichen frisch, Abschluss alt -> er feuert und stirbt unterwegs
+  //   beide frisch       -> alles in Ordnung
+  const beat = await store.get(env, 'heartbeat');
+  const beatAgeMinutes = beat ? Math.round((Date.now() - new Date(beat).getTime()) / 60000) : null;
+
+  return json({
+    ...h,
+    ageMinutes,
+    letzterStart: beat || null,
+    startAgeMinutes: beatAgeMinutes,
+    diagnose:
+      beat == null
+        ? 'kein Lebenszeichen – Worker läuft noch mit der alten Fassung'
+        : beatAgeMinutes > 30
+        ? 'Cron feuert nicht (Trigger oder Plattform)'
+        : ageMinutes > 30
+        ? 'Cron startet, bricht aber vor dem Abschluss ab'
+        : 'in Ordnung',
+  });
 }
 
 // ---------- Bild-Proxy für die Post-Grafiken ----------
@@ -543,6 +565,14 @@ async function runCron(env) {
   const alerts = [];
   const errors = [];
   let checked = 0;
+
+  // Lebenszeichen SOFORT wegschreiben, bevor irgendwas Aufwendiges passiert.
+  // Ohne das sehen "Cron feuert gar nicht" und "Cron feuert und stirbt
+  // unterwegs" von außen genau gleich aus – beide Male steht in /api/health
+  // ein alter Zeitstempel. Wird ein Lauf von Cloudflare abgeräumt (Zeit- oder
+  // CPU-Limit), bleibt wenigstens dieser Eintrag stehen und verrät es.
+  const startedAt = new Date().toISOString();
+  await store.put(env, 'heartbeat', startedAt, HEALTH_TTL);
 
   try {
     const hits = await alarmDeals(env);
