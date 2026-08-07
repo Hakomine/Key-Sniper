@@ -120,6 +120,7 @@ export default {
     if (url.pathname === '/api/keyshop') return handleKeyshop(url, env, ctx);
     if (url.pathname === '/api/radar') return handleRadar(url, env, ctx);
     if (url.pathname === '/api/health') return handleHealth(env);
+    if (url.pathname === '/api/cron-jetzt') return handleCronJetzt(env, ctx);
     if (url.pathname === '/img') return handleImg(url);
     if (url.pathname === '/overlay') {
       return new Response(OVERLAY_HTML, {
@@ -524,6 +525,35 @@ async function handleHealth(env) {
         : ageMinutes > 30
         ? 'Cron startet, bricht aber vor dem Abschluss ab'
         : 'in Ordnung',
+  });
+}
+
+// ---------- Cron von Hand auslösen ----------
+// Zweierlei Nutzen: als Notknopf, wenn Cloudflares Zeitplan mal aussetzt, und
+// als Diagnose – läuft der Cron hierüber sauber durch, ist der Code gesund und
+// nur der Auslöser klemmt.
+//
+// Bewusst ohne Passwort, aber selbstbegrenzend: gearbeitet wird nur, wenn der
+// letzte Lauf ohnehin überfällig ist. Damit kann die Adresse niemand nutzen,
+// um die API zu überlasten – im Normalbetrieb tut sie schlicht nichts.
+async function handleCronJetzt(env, ctx) {
+  const raw = await store.get(env, 'health');
+  const letzter = raw ? new Date(JSON.parse(raw).at).getTime() : 0;
+  const alterMin = Math.round((Date.now() - letzter) / 60000);
+
+  if (alterMin < 20) {
+    return json({
+      gestartet: false,
+      grund: `letzter Lauf erst ${alterMin} Min her – erst ab 20 Min nötig`,
+      ageMinutes: alterMin,
+    });
+  }
+
+  ctx.waitUntil(runCron(env));
+  return json({
+    gestartet: true,
+    vorherAlterMinuten: alterMin,
+    hinweis: 'Läuft im Hintergrund. In ~30 Sekunden /api/health abfragen.',
   });
 }
 
