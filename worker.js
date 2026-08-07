@@ -518,7 +518,7 @@ async function handleHealth(env) {
     startAgeMinutes: beatAgeMinutes,
     diagnose:
       beat == null
-        ? 'kein Lebenszeichen – Worker läuft noch mit der alten Fassung'
+        ? 'noch kein Lebenszeichen – seit dem letzten Deploy hat der Cron noch nicht gefeuert (bis zu 10 Min warten)'
         : beatAgeMinutes > 30
         ? 'Cron feuert nicht (Trigger oder Plattform)'
         : ageMinutes > 30
