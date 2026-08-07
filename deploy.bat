@@ -29,9 +29,14 @@ git push
 if errorlevel 1 goto :fehler
 
 echo.
-echo   Fertig. Der naechste stuendliche Lauf benutzt den neuen Stand.
-echo   Am Cloudflare-Worker aendert das nichts - der wird separat
-echo   ueber das Dashboard gepflegt.
+echo   Worker zu Cloudflare deployen...
+echo.
+call npx wrangler deploy
+if errorlevel 1 goto :fehler
+
+echo.
+echo   Fertig. Achte oben darauf, dass ZWEI Bindings gelistet sind:
+echo   env.SNIPER_KV und env.GENRES_URL, dazu schedule: */10 * * * *
 echo.
 pause
 exit /b 0

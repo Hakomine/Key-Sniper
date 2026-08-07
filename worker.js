@@ -55,7 +55,10 @@ const ratingOk = (r, c) =>
 // Wächter: merkt, wenn der Cron stirbt oder eine API ausfällt
 const HEALTH_TTL = 7 * 24 * 3600;
 const ERROR_COOLDOWN = 3600;    // Fehler höchstens 1x pro Stunde melden
-const REPORT_HOUR_UTC = 7;      // Tagesbericht ab dieser UTC-Stunde (~9 Uhr DE)
+// Lebenszeichen zu festen Uhrzeiten (UTC) = 9, 15 und 21 Uhr deutscher Zeit.
+// Bewusst nichts nachts: eine Meldung, die um 3 Uhr klingelt, wird weggewischt
+// statt gelesen - und dann ist der Waechter nur noch Rauschen.
+const REPORT_HOURS_UTC = [7, 13, 19];
 
 // Bild-Proxy (versorgt das Stream-Overlay mit Covern)
 const IMG_HOSTS = ['assets.isthereanydeal.com', 'cdn.cloudflare.steamstatic.com'];
@@ -687,10 +690,13 @@ async function reportError(env, errors) {
 // wenn gerade wirklich keine Deals da sind.
 async function dailyReport(env, checked, alerts) {
   const now = new Date();
-  if (now.getUTCHours() < REPORT_HOUR_UTC) return;
-  const today = now.toISOString().slice(0, 10);
-  if ((await store.get(env, 'daily_report')) === today) return;
-  await store.put(env, 'daily_report', today, 3 * 24 * 3600);
+  // Der zuletzt erreichte Zeitpunkt aus der Liste. Pro Zeitpunkt genau eine
+  // Meldung - egal wie oft der Cron dazwischen laeuft.
+  const faellig = REPORT_HOURS_UTC.filter((h) => now.getUTCHours() >= h).pop();
+  if (faellig === undefined) return;
+  const slot = now.toISOString().slice(0, 10) + '-' + faellig;
+  if ((await store.get(env, 'daily_report')) === slot) return;
+  await store.put(env, 'daily_report', slot, 3 * 24 * 3600);
   await sendDiscordRaw(env, {
     username: 'Key Sniper',
     embeds: [
@@ -700,7 +706,7 @@ async function dailyReport(env, checked, alerts) {
           'Gerade ' + checked + ' Spiele geprüft.' +
           (alerts ? ' ' + alerts + ' neue Treffer dabei.' : ' Aktuell nichts Neues.'),
         color: 4906624,
-        footer: { text: 'Tägliches Lebenszeichen' },
+        footer: { text: 'Lebenszeichen · 9, 15 und 21 Uhr' },
       },
     ],
   });
