@@ -92,6 +92,19 @@ Keys stehen **nicht** in diesen Dateien: lokal in `key.txt` / `ggkey.txt` (beide
   Zeitlimit, maximal 5 Rate-Limit-Runden, `retry-after` auf 60 s gedeckelt und
   `timeout-minutes: 8` im Workflow.
 
+- **Der Cron sprengte den Gratis-Worker.** Am 07.08.2026 stand er ab 13:50
+  still: er feuerte weiter, wurde aber jedes Mal abgeräumt, bevor er seinen
+  Zustand speichern konnte. Von außen sah das aus wie „Cron feuert nicht" –
+  ununterscheidbar, weil der Zustand erst ganz am Ende geschrieben wurde.
+  Gelöst durch zwei Änderungen: ein **Lebenszeichen gleich beim Start**
+  (`/api/health` zeigt jetzt `letzterStart` und sagt im Feld `diagnose`, wo es
+  klemmt), und der **Zustand wird nach jeder Stufe** gesichert statt nur zum
+  Schluss. Ursache selbst: Alarm (200 Spiele) **und** Radar (100) in einem
+  Lauf waren zu viel – der Radar läuft jetzt nur noch alle 30 Minuten.
+- **Wenn der Zustand nur am Ende geschrieben wird, ist er als Wächter wertlos.**
+  Ein abgeräumter Lauf hinterlässt dann keine Spur. Lieber nach jeder Stufe
+  speichern, auch wenn es einen KV-Schreibvorgang mehr kostet.
+
 ## Notizen
 - Region steht auf DE/EUR (`COUNTRY` in `worker.js`, `country` in `config.json`).
 - Das Repo ist **öffentlich** auf GitHub – hier also nichts Privates reinschreiben.

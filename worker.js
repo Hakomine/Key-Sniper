@@ -34,6 +34,7 @@ const RADAR_NEAR_LOW_PCT = 15;   // "auf Keyshop-Tief"-Badge, wenn <= 15% über 
 const RADAR_MAX_OVER_LOW = 30;   // in die Liste, wenn Keyshop <= 30% über dem Tief …
 const RADAR_MIN_CUT = 35;        // … ODER mindestens 35% unter dem offiziellen Preis
 const RADAR_BLOCK = 100;         // Spiele pro GG.deals-Anfrage (Rate-Limit: 100/Min)
+const RADAR_EVERY_MIN = 30;      // Radar nur alle 30 Min statt bei jedem Cron-Takt
 const RADAR_TOTAL = 3000;      // Universumsgroesse: deckt auch Titel weit hinten ab
 const RADAR_BLOCK_TTL = 6 * 3600; // Blöcke 6 h gültig
 
@@ -604,6 +605,21 @@ async function runCron(env) {
   const startedAt = new Date().toISOString();
   await store.put(env, 'heartbeat', startedAt, HEALTH_TTL);
 
+  const saveHealth = (phase) =>
+    store.put(
+      env,
+      'health',
+      JSON.stringify({
+        at: new Date().toISOString(),
+        ok: errors.length === 0,
+        checked,
+        alerts: alerts.length,
+        phase,
+        error: errors.join(' | ') || null,
+      }),
+      HEALTH_TTL
+    );
+
   try {
     const hits = await alarmDeals(env);
     checked += ALARM_SCAN;
@@ -611,27 +627,35 @@ async function runCron(env) {
   } catch (e) {
     errors.push('Alarm-Check: ' + e.message);
   }
-  try {
-    const hits = await rotateRadar(env);
-    checked += RADAR_BLOCK;
-    alerts.push(...hits);
-  } catch (e) {
-    errors.push('Radar: ' + e.message);
-  }
+
+  // Zustand SOFORT nach der Alarm-Stufe sichern. Vorher stand er ganz am Ende:
+  // wurde der Lauf danach abgeräumt, sah es aus, als wäre nie etwas passiert –
+  // obwohl der wichtige Teil längst erledigt war.
+  await saveHealth('alarm');
 
   // Krasseste zuerst – sonst verdrängen viele normale Treffer die Keyshop-Funde
   // aus den zehn Embeds, die Discord pro Nachricht erlaubt.
   alerts.sort((a, b) => alertScore(b) - alertScore(a));
   if (alerts.length) await sendDiscord(env, alerts);
 
-  // Zustand festhalten – daran erkennt der externe Watchdog, ob es noch lebt
+  // Der Radar ist der teure Teil (eigener API-Abruf plus großes JSON). Zusammen
+  // mit dem Alarm hat das den Gratis-Worker gesprengt: der Lauf wurde jedes Mal
+  // abgeräumt, bevor er den Zustand schreiben konnte. Deshalb läuft er jetzt
+  // nur noch alle RADAR_EVERY_MIN Minuten statt bei jedem Cron-Takt.
+  const radarDran = new Date().getUTCMinutes() % RADAR_EVERY_MIN < 10;
+  if (radarDran) {
+    try {
+      const hits = await rotateRadar(env);
+      checked += RADAR_BLOCK;
+      alerts.push(...hits);
+      if (hits.length) await sendDiscord(env, hits);
+    } catch (e) {
+      errors.push('Radar: ' + e.message);
+    }
+  }
+
   const ok = errors.length === 0;
-  await store.put(
-    env,
-    'health',
-    JSON.stringify({ at: new Date().toISOString(), ok, checked, alerts: alerts.length, error: errors.join(' | ') || null }),
-    HEALTH_TTL
-  );
+  await saveHealth(radarDran ? 'fertig (mit Radar)' : 'fertig');
 
   if (!ok) await reportError(env, errors);
   else await dailyReport(env, checked, alerts.length);
