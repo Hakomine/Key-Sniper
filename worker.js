@@ -519,6 +519,8 @@ async function handleHealth(env) {
   return json({
     ...h,
     ageMinutes,
+    // Fehlt der Webhook, sendet der Worker klaglos ins Nichts.
+    webhookGesetzt: !!env.DISCORD_WEBHOOK,
     letzterStart: beat || null,
     startAgeMinutes: beatAgeMinutes,
     diagnose:

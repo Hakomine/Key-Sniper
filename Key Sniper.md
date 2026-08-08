@@ -86,6 +86,11 @@ Keys stehen **nicht** in diesen Dateien: lokal in `key.txt` / `ggkey.txt` (beide
   unter `/actions/runs/<id>/jobs`: `runner_name` leer und `steps` leer. Dann
   ist nichts gelaufen, und kein Code der Welt behebt es. Gegenprobe:
   <https://www.githubstatus.com>.
+- **Ein fehlender `DISCORD_WEBHOOK` fällt sonst nirgends auf.** Der Worker
+  sendet dann klaglos ins Nichts: Cron grün, `ok: true`, aber nie eine
+  Nachricht. Am 08.08.2026 war das Secret beim Gear Sniper verschwunden –
+  vermutlich beim Umstieg vom Dashboard auf `wrangler deploy`. Gegenprobe:
+  `npx wrangler secret list`, und `/api/health` zeigt jetzt `webhookGesetzt`.
 - **Node-fetch hat trotzdem kein Zeitlimit.** Bei der Fehlersuche aufgefallen,
   auch wenn es diesmal nicht die Ursache war: `fetch` ohne `signal` wartet
   endlos, wenn die Gegenstelle die Verbindung offen lässt. Abgesichert mit 20 s
