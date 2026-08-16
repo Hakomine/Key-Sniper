@@ -45,6 +45,14 @@ const ALARM_SCAN = 200;         // Spiele pro Alarm-Lauf (schlank wegen CPU-Limi
 const ALARM_TTL = 14 * 24 * 3600; // so lange gilt ein Deal als "schon gemeldet"
 const ALARM_REDROP_PCT = 10;    // erneut melden, wenn Preis nochmal 10% fällt
 const ALARM_MAX_EMBEDS = 10;    // Discord erlaubt max. 10 Embeds pro Nachricht
+// Angebote je Spiel, die ITAD zurückschicken soll. Mit 0 (= alle) wurde die
+// Antwort 885 KB groß und JEDER Cron-Lauf starb an "exceededCpu" – allein das
+// Parsen kostete rund 3 ms. Mit 5 sind es 389 KB, und der Lauf kommt durch
+// (nachgemessen am 16.08.2026: 22 ms CPU, outcome "ok"). analyze() braucht
+// ohnehin nur die zwei billigsten seriösen Shops. Gegengeprüft an 188 Spielen:
+// schon 3 Angebote lieferten dieselben 35 Treffer wie die volle Liste, 5 lassen
+// Luft. Nicht weiter senken, ohne das erneut nachzumessen.
+const ALARM_CAPACITY = 5;
 // Billig heißt nicht gut: schwach bewertete Spiele lösen keinen Alarm aus.
 const ALARM_MIN_RATING = 75;    // % positiv auf Steam
 const ALARM_MIN_VOTES = 50;     // darunter ist die Quote wertlos ("100% bei 3 Reviews")
@@ -740,7 +748,7 @@ async function alarmDeals(env) {
   for (const c of list) if (c && c.id && !meta.has(c.id)) meta.set(c.id, c);
   const prices = await itad('/games/prices/v3', {
     method: 'POST',
-    query: { country: COUNTRY, capacity: 0 },
+    query: { country: COUNTRY, capacity: ALARM_CAPACITY },
     body: [...meta.keys()],
     key,
   });

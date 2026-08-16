@@ -12,10 +12,10 @@ Angeboten **von allein per Discord Bescheid gibt**. Ausgangspunkt war ein Fund a
 GG.deals: ein Key für 3 €, der nächstbillige Anbieter bei 10 € – also 7 € Lücke.
 Genau dieses Muster sucht die App automatisch.
 
-Getrennt vom [[Kontrollzentrum]] – ist ein eigenes Tool.
+Eigenständiges Tool, läuft unabhängig von allem anderen.
 
 ## Wo es läuft
-- **Cloud-App (Hauptversion)**: Cloudflare Worker unter `key-sniper.hakanking0110.workers.dev`.
+- **Cloud-App (Hauptversion)**: Cloudflare Worker unter `key-sniper.hakomine.workers.dev`.
   Holt die Preise live beim Öffnen, läuft auch am Handy, Keys liegen als Secrets.
 - **Desktop-App**: `run.bat` → Icon auf dem Desktop. Sammelt lokal und öffnet `Key Sniper.html`.
 - **GitHub**: hält die Genre-Datenbank aktuell (Job läuft stündlich) und hostet sie für den Worker.
@@ -109,6 +109,38 @@ Keys stehen **nicht** in diesen Dateien: lokal in `key.txt` / `ggkey.txt` (beide
 - **Wenn der Zustand nur am Ende geschrieben wird, ist er als Wächter wertlos.**
   Ein abgeräumter Lauf hinterlässt dann keine Spur. Lieber nach jeder Stufe
   speichern, auch wenn es einen KV-Schreibvorgang mehr kostet.
+
+### Der zweite CPU-Ausfall (16.08.2026)
+- **`capacity: 0` bei ITAD holt *alle* Angebote je Spiel – 885 KB.** Allein das
+  Parsen kostete rund 3 ms. Ab 16:20 UTC starb jeder Lauf mit
+  `outcome: "exceededCpu"`, sichtbar nur über
+  `npx wrangler tail key-sniper --format=json`. Auf `capacity: 5` gestellt:
+  389 KB, und **dieselben 35 Alarm-Treffer** – nachgemessen an 188 Spielen,
+  Abweichung null. `analyze()` braucht ohnehin nur die zwei billigsten
+  seriösen Shops. Danach zwei Läufe in Folge `outcome: "ok"`.
+- **Das CPU-Limit ist nicht einfach „10 ms".** Nach dem Fix laufen **22 ms**
+  sauber durch, vorher brach der Lauf bei gemeldeten 10 ms ab. Die alte Notiz
+  „Cloudflare-Free gibt Cron-Läufen nur 10 ms CPU" ist als feste Zahl also
+  falsch. Belegt ist nur das Verhältnis: 885 KB rissen das Limit, 389 KB nicht.
+  Im Zweifel misst `wrangler tail` die Wahrheit, nicht die Doku.
+- **Ein CPU-Abbruch ist unsichtbar, nicht nur unauffällig.** `exceptions` und
+  `logs` im Mitschnitt sind **leer**, und kein `try/catch` greift – Cloudflare
+  räumt die Isolate ab, statt einen Fehler zu werfen. Deshalb sah es aus wie
+  „Worker tot", obwohl Oberfläche und API die ganze Zeit sauber antworteten.
+  **Erkennungsmerkmal**: `/api/health` zeigt frischen `letzterStart`, aber
+  stundenaltes `at` – genau dafür ist das `diagnose`-Feld da, und es hat
+  wörtlich gestimmt.
+- **Der Engpass war nicht der, den man vermutet.** Erster Verdacht war die
+  stündlich wachsende `genres-db.json`. Nachgemessen: 0,83 ms von 10 – nicht
+  die Ursache. Der Brocken war die Preis-Antwort. Erst messen, dann umbauen.
+- **Die workers.dev-Adresse hier war falsch.** Die Account-Subdomain heißt
+  **`hakomine`**, nicht `hakanking0110` (das ist die E-Mail). Abfragbar mit
+  `npx wrangler whoami` plus `/accounts/<id>/workers/subdomain`.
+- **Ein Commit ist kein Deploy.** Die Änderungen vom 08.08. lagen seit acht
+  Tagen im Repo, aber der Worker lief noch auf dem Stand vom 07.08. – zu
+  erkennen daran, dass `/api/health` das damals eingebaute `webhookGesetzt`
+  gar nicht zeigte. `npx wrangler deployments list --name key-sniper` sagt,
+  was wirklich läuft.
 
 ## Notizen
 - Region steht auf DE/EUR (`COUNTRY` in `worker.js`, `country` in `config.json`).
